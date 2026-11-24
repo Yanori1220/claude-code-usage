@@ -6,12 +6,13 @@
     python3 cc_usage.py --page week     # start on another page
     python3 cc_usage.py --theme amber   # start with another theme (hero / dash / amber)
 
-Pages (left / right): Overview, Today, Week, All time. The layout follows the
-window's size: it is laid out for a quarter of the screen and shows more when wider.
-The last three list the projects; up / down move, Enter opens a project into its
-sessions, by title. t switches the theme (Hero, Dashboard, Amber); the one showing
-when it closes (Ctrl-C, the window closed, a kill) opens next time. No other key does
-anything, and nothing typed is shown or left for the shell.
+Pages (left / right): Overview, Today, Week, All time, Spend, History. The layout
+follows the window's size: it is laid out for a quarter of the screen and shows more
+when wider. Today, Week and All time list the projects: up / down move, Enter opens a
+project into its sessions, by title, and a session into its own page (Esc goes back);
+s sorts them by cost or by last use. t switches the theme (Hero, Dashboard, Amber).
+The theme and sort it closes on (Ctrl-C, the window closed, a kill) open next time.
+No other key does anything, and nothing typed is shown or left for the shell.
 
 Source: Claude Code's own transcripts, ~/.claude/projects/<project>/<session>.jsonl
 (a session's subagents in <session>/subagents/*.jsonl). Every API response Claude Code
@@ -120,6 +121,7 @@ FIVE_HOURS = dt.timedelta(hours=5)  # the "Current session" window in /usage
 PAGES = ["Overview", "Today", "Week", "All time", "Spend", "History"]
 PAGE_ARGS = {"overview": 0, "today": 1, "week": 2, "all": 3, "spend": 4, "history": 5}
 SPEND, HISTORY = 4, 5
+SORTS = ["cost", "recent"]  # the project lists' orders, switched with s
 
 
 def base_model(model):
@@ -1003,6 +1005,7 @@ class UI:
         self.background = None  # the terminal's own background, (r, g, b), when it said
         self.live = False  # --once draws no picked row
         self.detail = None  # (project, session) open on its own page, from a project list
+        self.sort = load_state().get("sort") if load_state().get("sort") in SORTS else "cost"  # the project lists' order
 
     @property
     def dark(self):
@@ -1037,6 +1040,10 @@ class UI:
         if self.detail is not None:
             if k in ("enter", "back"):
                 self.detail = None
+            return
+        if k == "sort" and self.page in (1, 2, 3):
+            self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
+            save_state(sort=self.sort)
             return
         rows = self.rows.get(self.page)
         if not rows or self.page in (0, SPEND, HISTORY):
@@ -1123,11 +1130,18 @@ def project_page(reader, ui, look, now, width, height):
     psum = {p: Sum.of(r for rs in ss.values() for r in rs) for p, ss in tree.items()}
     total = Sum.of(r for ss in tree.values() for rs in ss.values() for r in rs)
     top_usd = max((s.usd for s in psum.values()), default=0)
+    last = {(p, s): max(r.ts for r in rs) for p, ss in tree.items() for s, rs in ss.items()}
+    if ui.sort == "recent":  # newest first, projects by their newest session
+        p_key = lambda p: max(last[p, s] for s in tree[p])
+        s_key = lambda p, s: last[p, s]
+    else:  # most spent first
+        p_key = lambda p: psum[p].usd
+        s_key = lambda p, s: sum(r.usd or 0 for r in tree[p][s])
     rows = []
-    for p in sorted(tree, key=lambda p: psum[p].usd, reverse=True):
+    for p in sorted(tree, key=p_key, reverse=True):
         rows.append(("p", p, None))
         if p in ui.open:
-            for s in sorted(tree[p], key=lambda s: max(r.ts for r in tree[p][s]), reverse=True):
+            for s in sorted(tree[p], key=lambda s: s_key(p, s), reverse=True):
                 rows.append(("s", p, s))
     ui.rows[ui.page] = rows
     ui.view = view = max(3, height + 2 - CHROME[ui.theme])  # height here is the body's: tabs and hint already out
@@ -1139,8 +1153,9 @@ def project_page(reader, ui, look, now, width, height):
     shown = range(top, min(top + view, len(rows)))
 
     summary = Text(" " + (scope.upper() if look.caps else scope), style="bold")
-    summary.append(f"   {len(tree)} project{'s' if len(tree) != 1 else ''} · {total.money()} · {tok(total.total)} tok ",
-                   style=look.muted)
+    order = "by cost" if ui.sort == "cost" else "by last used"
+    summary.append(f"   {len(tree)} project{'s' if len(tree) != 1 else ''} · {total.money()} · {tok(total.total)} tok"
+                   f" · {order.upper() if look.caps else order} ", style=look.muted)
     scroll = Text(f" {top + 1}–{shown.stop} of {len(rows)} ", style=look.muted) if len(rows) > view else Text("")
 
     pick, pick_bar = ui.pick_style() if ui.live else (None, look.accent)
@@ -1565,7 +1580,7 @@ def render(reader, ui, now, width, height):
         keys = "esc / ⌫ back   ←/→ page   t theme   ^C quit"
     else:
         body = project_page(reader, ui, look, now, width, height - 2)
-        keys = "←/→ page   ↑/↓ move   ⏎ open   t theme   ^C quit"
+        keys = "←/→ page   ↑/↓ move   ⏎ open   s sort   t theme   ^C quit"
     hint = Text(" " + (keys.upper() if look.caps else keys), style=look.muted, no_wrap=True, overflow="ellipsis")
     unpriced = sorted({r.model for r in reader.recs.values() if r.usd is None})
     if unpriced:
@@ -1583,7 +1598,7 @@ KEYS = {
     b"\x1bOA": "up", b"\x1bOB": "down", b"\x1bOC": "right", b"\x1bOD": "left",
     b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
     b"\x1b[H": "home", b"\x1b[F": "end", b"\x1bOH": "home", b"\x1bOF": "end", b"\x1b[1~": "home", b"\x1b[4~": "end",
-    b"\r": "enter", b"\n": "enter", b" ": "enter", b"t": "theme", b"T": "theme",
+    b"\r": "enter", b"\n": "enter", b" ": "enter", b"t": "theme", b"T": "theme", b"s": "sort", b"S": "sort",
     b"\x7f": "back", b"\x08": "back",
 }
 

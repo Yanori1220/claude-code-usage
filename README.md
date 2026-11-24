@@ -93,6 +93,7 @@ no limits to show.
 | ← / → | switch page |
 | ↑ / ↓, PgUp / PgDn, Home / End | move through the project list |
 | Enter or Space | open or close a project; on a session, open its own page |
+| s | sort the project lists by cost or by last use (remembered) |
 | Esc or Backspace | back from a session's page |
 | t | switch theme |
 | Ctrl-C | quit |
@@ -123,7 +124,7 @@ set the variable for both `cc_usage.py` (your shell) and the mod (the `env` bloc
 | File | What |
 |---|---|
 | `ratelimits.json` | the latest limit readings, written by the mod |
-| `state.json` | the theme it was last closed on, and the alerts already sent, so a restart does not repeat them |
+| `state.json` | the theme and sort it was last closed on, and the alerts already sent, so a restart does not repeat them |
 | `aliases.json` | optional, written by hand: `{"old-project-folder": "new-name"}`, for a project whose folder you renamed or copied, so its sessions are counted once, under one name |
 
 ## How the numbers are worked out
