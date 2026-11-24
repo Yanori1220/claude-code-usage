@@ -53,6 +53,7 @@ import signal
 import subprocess
 import sys
 import termios
+import textwrap
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -671,6 +672,16 @@ def pace_text(info, look, caps=False, width=None):
     return t
 
 
+def pace_lines(info, look, width, rows):
+    """The pace line wrapped onto at most `rows` lines (one at least) of `width`; what still does not fit ends in …"""
+    t = _pace_text(info, look, False)
+    lines = textwrap.wrap(t.plain, width) or [""]
+    rows = max(1, rows)
+    if len(lines) > rows:
+        lines = lines[:rows - 1] + [" ".join(lines[rows - 1:])]
+    return [Text(line, style=t.style, no_wrap=True, overflow="ellipsis") for line in lines]
+
+
 def _pace_text(info, look, caps):
     up = (lambda x: x.upper()) if caps else (lambda x: x)
     if info["runout"]:
@@ -880,8 +891,15 @@ def overview_hero(d, look, width, height):
 
 
 def overview_dash(d, look, width, height):
-    side = min(40, max(30, width // 3))
-    gh = 6
+    side = max(30, width // 3)  # the right column: a third of the window, so it widens and narrows with it
+    sw = side - 2  # inside the right column's panels, less their border and padding
+    # the rows: the bottom one needs the current session's 6 and a line for each active session, and 11 at
+    # least for the week's bars; the top one, the activity chart and the budget, 11. Rows neither needs are
+    # shared out, half each, so both follow the window's height.
+    cur_h = 6
+    need = max(11, cur_h + 2 + max(1, len(d.active)))
+    top = 11 + max(0, height - 11 - need) // 2
+    gh = top - 5
     gw = max(18, width - side - 6)
     lines, bucket, peak = activity_chart(d.recs, d.now, gw, gh + 3, look, dark=d.dark)
     title = lambda s: Text(f" {s} ", style=f"bold {look.accent}")
@@ -902,21 +920,24 @@ def overview_dash(d, look, width, height):
     if d.limit:
         pct = d.limit["pct"]
         gone = d.limit["gone"]
-        budget += [grid2(Text("weekly limit", style=look.muted), Text(f"{pct:g}%", style="bold")),
-                   meter(pct / 100, side - 4, look, gone),
-                   time_caption("", mark_x(gone, side - 4), side - 4, gone, "week", look),
-                   Text(reset_text(d), style=look.muted, no_wrap=True, overflow="ellipsis"), pace_text(d.limit, look)]
+        # 8 lines and the pace. Rows to spare go first to the pace, which wraps rather than being cut, then
+        # up to two part the figures from the limit; any more are left below
+        block = [grid2(Text("weekly limit", style=look.muted), Text(f"{pct:g}%", style="bold")),
+                 meter(pct / 100, sw, look, gone),
+                 time_caption("", mark_x(gone, sw), sw, gone, "week", look),
+                 Text(reset_text(d), style=look.muted, no_wrap=True, overflow="ellipsis"),
+                 *pace_lines(d.limit, look, sw, top - 10)]
+        budget += [""] * min(2, top - 6 - len(block)) + block
     else:
         budget += ["", Text(f"weekly limit: {d.info}", style=look.muted)]
 
-    bottom = max(6, height - (gh + 5))
+    bottom = max(6, height - top)
     ses = Table.grid(expand=True, padding=(0, 1))
     ses.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
     ses.add_column(no_wrap=True, style=look.muted)
     ses.add_column(no_wrap=True)
     for _ in range(3):
         ses.add_column(no_wrap=True, justify="right")
-    cur_h = 6
     ses_h = max(3, bottom - cur_h)
     for a in d.active[:ses_h - 2]:
         ses.add_row(Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else None), a.model,
@@ -929,10 +950,11 @@ def overview_dash(d, look, width, height):
                         panel(ses, f"sessions · last {ACTIVE_MIN} min", ses_h))
 
     top_usd = max(s.usd for _, s, _, _ in d.days) or 1
-    bars = vbars([0 if fut else s.usd / top_usd for _, s, fut, _ in d.days], max(2, bottom - 5), 3, look.accent)
+    colw = max(3, sw // 7 - 1)  # the seven bars, a space after each, fill the column's width
+    bars = vbars([0 if fut else s.usd / top_usd for _, s, fut, _ in d.days], max(2, bottom - 5), colw, look.accent)
     labels = Text(no_wrap=True)
     for day, _, _, today in d.days:
-        labels.append(WEEKDAY[day.weekday()] + " ", style="bold" if today else look.muted)
+        labels.append(f"{WEEKDAY[day.weekday()]:^{colw}} ", style="bold" if today else look.muted)
     today_usd = Text(f"today {d.today.money()}  ·  week {d.week.money()}", style=look.muted)
 
     g = Table.grid(expand=True)
@@ -1687,6 +1709,13 @@ def main():
 
     signal.signal(signal.SIGHUP, closed)
     signal.signal(signal.SIGTERM, closed)
+    # a resize (SIGWINCH) draws the screen again at once rather than at the next read: each signal writes
+    # a byte to this pipe, which wakes the select below
+    woken, wake = os.pipe()
+    os.set_blocking(woken, False)
+    os.set_blocking(wake, False)
+    signal.set_wakeup_fd(wake)
+    signal.signal(signal.SIGWINCH, lambda signum, frame: None)
     try:
         alerts = Alerts(enabled=not args.no_alerts)
         alerts.check(reader, dt.datetime.now().astimezone())
@@ -1697,9 +1726,10 @@ def main():
                 next_read = time.monotonic() + args.every
                 while True:
                     wait = max(0.0, next_read - time.monotonic())
-                    if fd is None:
-                        time.sleep(wait)
-                    elif select.select([fd], [], [], wait)[0]:
+                    ready = select.select([woken] if fd is None else [fd, woken], [], [], wait)[0]
+                    if woken in ready:
+                        os.read(woken, 1024)
+                    if fd in ready:
                         for k in parse_keys(os.read(fd, 1024)):
                             ui.key(k)
                     if time.monotonic() >= next_read:
