@@ -61,6 +61,7 @@ from types import SimpleNamespace
 
 from rich import box
 from rich.align import Align
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
@@ -74,6 +75,7 @@ DATA = Path(os.environ.get("CC_USAGE_DIR") or Path.home() / "cc-usage")  # the m
 LIMITS = DATA / "ratelimits.json"  # written by the cc-usage-limits mod
 STATE = DATA / "state.json"  # the theme it was last closed on, and the alerts already sent
 ACTIVE_MIN = 30  # a session is shown as active if it got a response in the last N minutes
+CONTEXT_WARN = (400_000, 700_000)  # context sizes (tokens) a session is warned about, then alerted again
 
 
 def load_aliases():
@@ -115,9 +117,9 @@ FAST = 2.0  # fast mode costs twice the standard price on every model that has i
 WEEKDAY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 WEEK = dt.timedelta(days=7)
 FIVE_HOURS = dt.timedelta(hours=5)  # the "Current session" window in /usage
-PAGES = ["Overview", "Today", "Week", "All time", "Spend"]
-PAGE_ARGS = {"overview": 0, "today": 1, "week": 2, "all": 3, "spend": 4}
-SPEND = 4
+PAGES = ["Overview", "Today", "Week", "All time", "Spend", "History"]
+PAGE_ARGS = {"overview": 0, "today": 1, "week": 2, "all": 3, "spend": 4, "history": 5}
+SPEND, HISTORY = 4, 5
 
 
 def base_model(model):
@@ -491,12 +493,40 @@ def severity(frac, look):
     return look.accent if frac < 0.7 else look.warn if frac < 0.9 else look.danger
 
 
+def mark_x(mark, width):
+    """The column of a meter's ┃ mark."""
+    return min(int(max(0.0, min(mark, 1.0)) * width), width - 1)
+
+
+def time_caption(left, x, width, gone, window, look, caps=False):
+    """The line under a meter: `left`, then the label of the ┃ mark set right under it (column x), on
+    whichever side has room, so its ┃ carries the mark's line down and the mark reads as "now"."""
+    up = (lambda v: v.upper()) if caps else (lambda v: v)
+    width_left = cell_len(left)
+    t = Text(left, style=look.muted, no_wrap=True)
+    for core in (up(f"now · {gone:.0%} of the {window} gone"), up(f"now · {gone:.0%}")):
+        if x >= width_left + 2 and x + len(core) + 2 <= width:  # after the mark
+            t.append(" " * (x - width_left))
+            t.append("┃", style="bold")
+            t.append(" " + core, style=look.muted)
+            break
+        if x + 1 - (len(core) + 2) >= width_left + 2:  # before it
+            t.append(" " * (x + 1 - (len(core) + 2) - width_left))
+            t.append(core + " ", style=look.muted)
+            t.append("┃", style="bold")
+            break
+    else:  # no room beside the mark: the label at the end of the line
+        t.append("   " + up(f"┃ now · {gone:.0%} of the {window} gone"), style=look.muted)
+    t.truncate(width, overflow="ellipsis", pad=True)
+    return t
+
+
 def meter(frac, width, look, mark=None):
     """A one-line meter: the fill coloured by severity, the track the same hue dimmed, `mark` as ┃."""
     frac = max(0.0, min(frac, 1.0))
     color = severity(frac, look)
     filled = round(frac * width)
-    at = None if mark is None else min(int(max(0.0, min(mark, 1.0)) * width), width - 1)
+    at = None if mark is None else mark_x(mark, width)
     t = Text(no_wrap=True)
     for i in range(width):
         if i == at:
@@ -663,6 +693,21 @@ def active_sessions(recs, now):
     return sorted(active, key=lambda a: a[0], reverse=True)
 
 
+def session_info(reader, sid, rs):
+    """An active session at a glance: its context now, and what each request costs at that size."""
+    main = sorted((r for r in rs if not r.sub), key=lambda r: r.ts)
+    recent = (main or sorted(rs, key=lambda r: r.ts))[-5:]
+    sent = main[-1].sent if main else 0
+    return SimpleNamespace(sid=sid, title=reader.title(sid), model=model_cell(main or rs), frac=context_frac(rs),
+                           sum=Sum.of(rs), sent=sent, warn=sent >= CONTEXT_WARN[0],
+                           per_req=sum(r.usd or 0 for r in recent) / len(recent) if recent else 0)
+
+
+def per_req_text(a, look, caps=False):
+    t = f"~{money(a.per_req)}/req"
+    return Text(t.upper() if caps else t, style=f"bold {look.warn}" if a.warn else look.muted)
+
+
 def gather(reader, now):
     recs = list(reader.recs.values())
     day0, week0 = bounds(now)
@@ -679,7 +724,7 @@ def gather(reader, now):
         today=Sum.of(r for r in recs if r.ts >= day0),
         proj=week.scaled(WEEK / elapsed) if elapsed >= dt.timedelta(hours=1) else None,
         limit=info if isinstance(info, dict) else None,
-        active=[(reader.title(s), model_cell(rs), context_frac(rs), Sum.of(rs)) for _, s, rs in active_sessions(recs, now)],
+        active=[session_info(reader, s, rs) for _, s, rs in active_sessions(recs, now)],
     )
 
 
@@ -702,8 +747,7 @@ def limit_block(info, reason, label, look, width, now, window, wrap=lambda x: x)
     detail = f"resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
     return [wrap(grid2(Text(label, style=look.muted), Text(f"{pct:g}% used", style="bold"), width=width)),
             wrap(meter(pct / 100, width, look, gone)),
-            wrap(grid2(Text(detail, style=look.muted), Text(f"┃ {gone:.0%} of the {window} gone", style=look.muted),
-                       width=width)),
+            wrap(time_caption(detail, mark_x(gone, width), width, gone, window, look)),
             wrap(pace_text(info, look, width=width))]
 
 
@@ -712,14 +756,15 @@ def amber_limit(label, info, reason, window, look, width, now):
     if not info:
         return [Text(f"> {label:<15} {str(reason).upper()}", style=AMBER_DIM, no_wrap=True, overflow="ellipsis")]
     pct, gone, reset, left = info["pct"], info["gone"], info["reset"], info["left"]
-    line = Text(f"> {label:<15} [", style=AMBER, no_wrap=True)
-    line.append_text(meter(pct / 100, max(10, width - 31), look, gone))
+    prefix = f"> {label:<15} ["
+    mw = max(10, width - 31)
+    line = Text(prefix, style=AMBER, no_wrap=True)
+    line.append_text(meter(pct / 100, mw, look, gone))
     line.append(f"] {pct:5.1f}%", style=f"bold {AMBER}")
     at = f"{WEEKDAY[reset.weekday()]} {reset:%H:%M}" if window == "week" else f"{reset:%H:%M}"
-    detail = f"  resets {at} · in {until(reset - now)}   ·   ┃ {gone:.0%} of {window} elapsed"
-    detail += f"   ·   ~{left.money()} left" if left else ""
-    pace = pace_text(info, look, caps=True)
-    return [line, Text(detail.upper(), style=AMBER_DIM, no_wrap=True, overflow="ellipsis"), Text("  ") + pace]
+    detail = f"  resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
+    caption = time_caption(detail.upper(), len(prefix) + mark_x(gone, mw), width, gone, window, look, caps=True)
+    return [line, caption, Text("  ") + pace_text(info, look, caps=True)]
 
 
 def reset_text(d):
@@ -754,7 +799,8 @@ def activity_chart(recs, now, width, height, look, hours=6, dark=False):
     ticks = {0: top, rows // 2: top * (1 - (rows // 2) / rows)}
     lines = []
     for r, row in enumerate(plot):
-        t = Text(f"{money(ticks[r]):>{label_w - 1}} ┤" if r in ticks else " " * label_w + "│", style=look.muted, no_wrap=True)
+        t = Text(no_wrap=True)  # the muted style on the axis alone, or the chart would be dimmed with it
+        t.append(f"{money(ticks[r]):>{label_w - 1}} ┤" if r in ticks else " " * label_w + "│", style=look.muted)
         t.append_text(row)
         lines.append(t)
     start = now - dt.timedelta(hours=hours)
@@ -822,10 +868,11 @@ def overview_hero(d, look, width, height):
         g = Table.grid(padding=(0, 3))
         g.width = mw
         g.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-        for _ in range(3):
+        for _ in range(4):
             g.add_column(no_wrap=True, justify="right")
-        for title, _, frac, s in d.active[:room]:
-            g.add_row(Text(title, style=look.muted), meter(frac or 0, 12, look), f"{(frac or 0):.0%}", s.money())
+        for a in d.active[:room]:
+            g.add_row(Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else look.muted),
+                      meter(a.frac or 0, 12, look), f"{(a.frac or 0):.0%}", per_req_text(a, look), a.sum.money())
         parts += [*gap, c(g)]
     return [Align.center(Group(*parts), vertical="middle", height=height)]
 
@@ -834,7 +881,7 @@ def overview_dash(d, look, width, height):
     side = min(40, max(30, width // 3))
     gh = 6
     gw = max(18, width - side - 6)
-    lines, bucket, peak = activity_chart(d.recs, d.now, gw, gh + 2, look, dark=d.dark)
+    lines, bucket, peak = activity_chart(d.recs, d.now, gw, gh + 3, look, dark=d.dark)
     title = lambda s: Text(f" {s} ", style=f"bold {look.accent}")
     panel = lambda body, name, h: Panel(body, title=title(name), title_align="left", box=box.ROUNDED,
                                          border_style=look.accent, height=h)
@@ -852,25 +899,28 @@ def overview_dash(d, look, width, height):
     budget = [st]
     if d.limit:
         pct = d.limit["pct"]
+        gone = d.limit["gone"]
         budget += [grid2(Text("weekly limit", style=look.muted), Text(f"{pct:g}%", style="bold")),
-                   meter(pct / 100, side - 4, look, d.limit["gone"]), Text(reset_text(d), style=look.muted),
-                   pace_text(d.limit, look)]
+                   meter(pct / 100, side - 4, look, gone),
+                   time_caption("", mark_x(gone, side - 4), side - 4, gone, "week", look),
+                   Text(reset_text(d), style=look.muted, no_wrap=True, overflow="ellipsis"), pace_text(d.limit, look)]
     else:
         budget += ["", Text(f"weekly limit: {d.info}", style=look.muted)]
 
-    bottom = max(6, height - (gh + 4))
+    bottom = max(6, height - (gh + 5))
     ses = Table.grid(expand=True, padding=(0, 1))
     ses.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
     ses.add_column(no_wrap=True, style=look.muted)
     ses.add_column(no_wrap=True)
-    ses.add_column(no_wrap=True, justify="right")
-    ses.add_column(no_wrap=True, justify="right")
+    for _ in range(3):
+        ses.add_column(no_wrap=True, justify="right")
     cur_h = 6
     ses_h = max(3, bottom - cur_h)
-    for t, model, frac, s in d.active[:ses_h - 2]:
-        ses.add_row(t, model, meter(frac or 0, 10, look), f"{(frac or 0):.0%}", s.money())
+    for a in d.active[:ses_h - 2]:
+        ses.add_row(Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else None), a.model,
+                    meter(a.frac or 0, 10, look), f"{(a.frac or 0):.0%}", per_req_text(a, look), a.sum.money())
     if not d.active:
-        ses.add_row(Text("none", style=look.muted), "", "", "", "")
+        ses.add_row(Text("none", style=look.muted), "", "", "", "", "")
     inner = width - side - 6
     left_bottom = Group(panel(Group(*limit_block(d.slimit, d.sinfo, "5-hour limit", look, inner, d.now, "5 h")),
                               "current session", cur_h),
@@ -886,7 +936,7 @@ def overview_dash(d, look, width, height):
     g = Table.grid(expand=True)
     g.add_column(ratio=1)
     g.add_column(width=side + 2)
-    g.add_row(panel(graph, graph_title, gh + 4), panel(Group(*budget), "budget", gh + 4))
+    g.add_row(panel(graph, graph_title, gh + 5), panel(Group(*budget), "budget", gh + 5))
     g.add_row(left_bottom, panel(Group(*bars, labels, today_usd), "week", bottom))
     return [g]
 
@@ -908,14 +958,18 @@ def overview_amber(d, look, width, height):
               "", *amber_limit("WEEKLY LIMIT", d.limit, d.info, "week", look, width, d.now)]
     parts += ["", Text("> ACTIVE PROCESSES", style=AMBER)]
     room = max(1, height - 22)
-    for n, (title, model, frac, s) in enumerate(d.active[:room], 1):
-        name = Text(title, style=AMBER)
-        name.truncate(max(10, width - 52), overflow="ellipsis", pad=True)
+    for n, a in enumerate(d.active[:room], 1):
+        name = Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else AMBER)
+        name.truncate(max(10, width - 66), overflow="ellipsis", pad=True)
         t = Text(f"  {n:02d} ", style=AMBER_DIM, no_wrap=True)
         t.append_text(name)
-        t.append(f" {model.upper():<10} CTX ", style=AMBER_DIM)
-        t.append_text(meter(frac or 0, 10, look))
-        t.append(f" {(frac or 0):4.0%}  {s.money():>8}", style=hot)
+        t.append(f" {a.model.upper():<10} CTX ", style=AMBER_DIM)
+        t.append_text(meter(a.frac or 0, 10, look))
+        t.append(f" {(a.frac or 0):4.0%}  ", style=hot)
+        req = per_req_text(a, look, caps=True)
+        req.pad_left(12 - len(req.plain))
+        t.append_text(req)
+        t.append(f"  {a.sum.money():>8}", style=hot)
         parts.append(t)
     if not d.active:
         parts.append(Text("  NONE", style=AMBER_DIM))
@@ -985,7 +1039,7 @@ class UI:
                 self.detail = None
             return
         rows = self.rows.get(self.page)
-        if not rows or self.page in (0, SPEND):
+        if not rows or self.page in (0, SPEND, HISTORY):
             return
         i = self.index()
         if k == "enter":
@@ -1173,11 +1227,18 @@ class Alerts:
                 early = until(reset - info["runout"])
                 fired.append(([f"{base}:runout"], f"{label} may run out at {info['runout']:%H:%M}",
                               f"{early} before it resets, at the last {info['recent']}'s pace.", True))
+        for _, sid, rs in active_sessions(recs, now):  # a session whose context has grown large
+            a = session_info(reader, sid, rs)
+            reached = [th for th in CONTEXT_WARN if a.sent >= th and f"ctx@{sid}:{th}" not in self.sent]
+            if reached:
+                fired.append(([f"ctx@{sid}:{th}" for th in reached], f"Context {tok(a.sent)} tokens: {a.title}",
+                              f"Each request now costs ~{money(a.per_req)}. /compact or a new session would cut that.",
+                              max(reached) >= CONTEXT_WARN[1]))
         for keys, title, body, urgent in fired:
             self.sent.update(keys)
             self.send(title, body, urgent)
-        if fired:  # keep only windows that have not reset yet
-            self.sent = {k for k in self.sent if int(k.split("@")[1].split(":")[0]) > now.timestamp()}
+        if fired:  # keep a limit window's alerts only until it resets
+            self.sent = {k for k in self.sent if k.startswith("ctx@") or int(k.split("@")[1].split(":")[0]) > now.timestamp()}
             save_state(alerts=sorted(self.sent))
 
 
@@ -1208,7 +1269,8 @@ def series_chart(values, plot_w, rows, look, fmt, dark):
     ticks = {0: top, rows // 2: top * (1 - (rows // 2) / rows)}
     lines = []
     for r, row in enumerate(braille([v / top for v in values], plot_w, rows, ramp)):
-        t = Text(f"{fmt(ticks[r]):>6} ┤" if r in ticks else " " * 7 + "│", style=look.muted, no_wrap=True)
+        t = Text(no_wrap=True)
+        t.append(f"{fmt(ticks[r]):>6} ┤" if r in ticks else " " * 7 + "│", style=look.muted)
         t.append_text(row)
         lines.append(t)
     return lines
@@ -1235,6 +1297,10 @@ def session_page(reader, ui, look, now, width, height):
             paid[k] += v
     paid_line = Text(" " + up("paid for: "), style=look.muted, no_wrap=True, overflow="ellipsis")
     paid_line.append(up(" · ".join(f"{k} {money(paid[k])}" for k in PAID_FOR if paid[k] > 0)))
+    info = session_info(reader, sid, rs)
+    warn = [Text(up(f" ⚠ context {tok(info.sent)} tokens: each request now costs ~{money(info.per_req)} (average of "
+                    f"the last 5). /compact or a new session would cut that."), style=f"bold {look.warn}",
+                 no_wrap=True, overflow="ellipsis")] if info.warn else []
 
     plot_w = max(10, inner - 8)
     n, slots = len(rs), plot_w * 2
@@ -1271,7 +1337,7 @@ def session_page(reader, ui, look, now, width, height):
     rebuilt_usd = sum((r.parts or {}).get("cache write", 0) for r in rs if id(r) in rebuilt)
     # rows left for the table: who, when, paid for, a gap, the charts, a gap, its title, its head and rule,
     # the rebuild line; the Dashboard drops the who line into its border and adds the border's two
-    k = max(1, height - 9 - len(charts) - (1 if dash else 0))
+    k = max(1, height - 9 - len(charts) - len(warn) - (1 if dash else 0))
     t = Table(box=box.SIMPLE_HEAD, show_edge=False, expand=True, pad_edge=True, border_style=look.muted,
               header_style=look.muted if ui.theme == "hero" else f"bold {look.accent}")
     for name, opts in [("When", {}), ("Model", {}), ("Sent", {"justify": "right"}), ("Cache wr", {"justify": "right"}),
@@ -1286,7 +1352,7 @@ def session_page(reader, ui, look, now, width, height):
                            f"{money(rebuilt_usd)} spent writing the context again" if rebuilt else
                            " no cache rebuilds: the context stayed cached between requests"),
                         style=look.muted, no_wrap=True, overflow="ellipsis")
-    body = [who, Text(up(line), style=look.muted, no_wrap=True, overflow="ellipsis"), paid_line, "", *charts, "",
+    body = [who, Text(up(line), style=look.muted, no_wrap=True, overflow="ellipsis"), paid_line, *warn, "", *charts, "",
             Text(up(" most expensive requests"), style="bold"), t, rebuild_line]
     if dash:
         return [Panel(Group(*body[1:]), title=Text(f" {reader.title(sid)} ", style=f"bold {look.accent}"),
@@ -1295,6 +1361,40 @@ def session_page(reader, ui, look, now, width, height):
 
 
 # ---------------------------------------------------------------- where the money goes
+
+
+def limits_by_project(recs, now, look, up, hero):
+    """How many points of each limit window each project used: its $ in the window over the window's allowance."""
+    windows = [("five_hour", FIVE_HOURS, "5-hour limit"), ("seven_day", WEEK, "Weekly limit")]
+    shares, totals = [], []
+    for kind, span, _ in windows:
+        info = limit_info(recs, now, kind, span)
+        share = defaultdict(float)
+        if isinstance(info, dict) and info["allowance"] and info["allowance"].usd > 0:
+            start = info["reset"] - span
+            for r in recs:
+                if r.ts >= start:
+                    share[r.project] += (r.usd or 0) / info["allowance"].usd * 100
+            totals.append(f"{sum(share.values()):.0f}%")
+        else:
+            totals.append("—")
+        shares.append(share)
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, show_footer=True, expand=True, pad_edge=True, footer_style="bold",
+              border_style=look.muted, header_style=look.muted if hero else f"bold {look.accent}")
+    t.add_column(up("Project"), no_wrap=True, ratio=1, overflow="ellipsis", footer=up("Used in all"))
+    for (_, _, label), total in zip(windows, totals):
+        t.add_column(up(label), no_wrap=True, justify="right", footer=total)
+        t.add_column("", no_wrap=True, width=10)
+    projects = sorted(set(shares[0]) | set(shares[1]), key=lambda p: (shares[1][p], shares[0][p]), reverse=True)
+    show = projects[:5]
+    rest = projects[5:]
+    pts = lambda v: "—" if v <= 0 else "<1%" if v < 1 else f"{v:.0f}%"
+    for p in show + (["(other projects)"] if rest else []):
+        vals = [sum(sh[q] for q in rest) if p == "(other projects)" else sh[p] for sh in shares]
+        t.add_row(up(p), *[c for v in vals for c in (pts(v), bar(v / 100, 10, look.accent))])
+    if not projects:
+        t.add_row(Text(up("no limit reading yet, or nothing used in these windows"), style=look.muted), "", "", "", "")
+    return t
 
 
 def spend_page(reader, ui, look, now, width, height):
@@ -1333,13 +1433,15 @@ def spend_page(reader, ui, look, now, width, height):
     t1 = table("Model", [[up(m)] + [c for i in range(3) for c in cell(by_model[i][m], totals[i])] for m in models],
                [money(x) for x in totals])
     kinds = [k for k in PAID_FOR if by_kind[2][k] > 0]
-    t2 = table("Paid for", [[up(k)] + [c for i in range(3) for c in cell(by_kind[i][k], totals[i])] for k in kinds])
-    rb = []
-    for _, rr in ranges:
+    rows = [[up(k)] + [c for i in range(3) for c in cell(by_kind[i][k], totals[i])] for k in kinds]
+    rb = [Text(up("  of which: cache rebuilds"), style=look.muted)]
+    for i, (_, rr) in enumerate(ranges):
         mine = [r for r in rr if id(r) in rebuilt]
-        rb += [f"{len(mine)} · {money(sum((r.parts or {}).get('cache write', 0) for r in mine))}", ""]
-    t3 = table("Cache rebuilt after a pause", [[up("times · $ to write the context again")] + rb])
-    sections = [("By model", t1), ("By what was paid for", t2), ("Cache rebuilds", t3)]
+        usd = sum((r.parts or {}).get("cache write", 0) for r in mine)
+        rb += [Text(f"{len(mine)}× {money(usd)}", style=look.muted), bar(usd / totals[i] if totals[i] else 0, 6, look.muted)]
+    t2 = table("Paid for", rows + [rb])
+    sections = [("Your limits, by project", limits_by_project(recs, now, look, up, ui.theme == "hero")), ("By model", t1),
+                ("By what was paid for", t2)]
     if dash:
         return [Panel(t, title=Text(f" {name} ", style=f"bold {look.accent}"), title_align="left", box=box.ROUNDED,
                       border_style=look.accent) for name, t in sections]
@@ -1347,6 +1449,84 @@ def spend_page(reader, ui, look, now, width, height):
     for name, t in sections:
         out += [Text((" > " if look.caps else " ") + up(name), style="bold"), t, ""]
     return out[:-1]
+
+
+# ---------------------------------------------------------------- the last 30 days
+
+
+def history_page(reader, ui, look, now, width, height):
+    recs = list(reader.recs.values())
+    up = (lambda x: x.upper()) if look.caps else (lambda x: x)
+    dash = ui.theme == "dash"
+    inner = width - (4 if dash else 2)
+    day0, _ = bounds(now)
+    days = [(day0 - dt.timedelta(days=i)).date() for i in range(29, -1, -1)]  # oldest first, today last
+    sums = {d: Sum() for d in days}
+    months = defaultdict(Sum)
+    month_days = defaultdict(set)
+    for r in recs:
+        if r.ts.date() in sums:
+            sums[r.ts.date()].add(r)
+        months[(r.ts.year, r.ts.month)].add(r)
+        month_days[(r.ts.year, r.ts.month)].add(r.ts.date())
+    total = Sum()
+    for d in days:
+        for f in fields(total)[:6]:
+            setattr(total, f.name, getattr(total, f.name) + getattr(sums[d], f.name))
+    busiest = max(days, key=lambda d: sums[d].usd)
+    active = sum(1 for d in days if sums[d].n)
+    summary = Text(" " + up("Last 30 days"), style="bold", no_wrap=True, overflow="ellipsis")
+    summary.append(up(f"   {total.money()} · ~{money(total.usd / 30)} a day · {active} days used · busiest "
+                      f"{WEEKDAY[busiest.weekday()]} {busiest:%m-%d} {sums[busiest].money()}"), style=look.muted)
+
+    plot_w = max(30, inner - 10)
+    xs = [round(i * plot_w / 30) for i in range(31)]  # each day's first column; the bars share the width out
+    rows = max(3, min(10, height - 16))
+    top = nice_ceiling(max(sums[d].usd for d in days))
+    ticks = {0: top, rows // 2: top * (1 - (rows // 2) / rows)}
+    chart = []
+    for r in range(rows):
+        t = Text(no_wrap=True)
+        t.append(f"{money(ticks[r]):>7} ┤" if r in ticks else " " * 8 + "│", style=look.muted)
+        for i, d in enumerate(days):
+            w = max(1, xs[i + 1] - xs[i] - 1)
+            level = sums[d].usd / top * rows - (rows - 1 - r)
+            ch = "█" if level >= 1 else VERT[int(level * 8)] if level > 0 else " "
+            t.append(ch * w, style=look.accent)
+            t.append(" ")
+        chart.append(t)
+    axis = list("─" * plot_w)
+    labels = [" "] * (plot_w + 6)
+    free = 0
+    for i in sorted(range(29, -1, -7)):  # today, and every seventh day back from it
+        x = xs[i] + max(0, (xs[i + 1] - xs[i] - 1) // 2)
+        axis[x] = "┴"
+        label = "today" if i == 29 else f"{days[i]:%m-%d}"
+        left = min(max(0, x - len(label) // 2), plot_w - len(label))
+        if left >= free:
+            labels[left:left + len(label)] = label
+            free = left + len(label) + 1
+    chart += [Text(f"{'$0':>7} └" + "".join(axis), style=look.muted, no_wrap=True),
+              Text(" " * 9 + up("".join(labels).rstrip()), style=look.muted, no_wrap=True)]
+
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, expand=True, pad_edge=True, border_style=look.muted,
+              header_style=look.muted if ui.theme == "hero" else f"bold {look.accent}")
+    for name, opts in [("Month", {}), ("Est. $", {"justify": "right"}), ("Tokens", {"justify": "right"}),
+                       ("Requests", {"justify": "right"}), ("Days used", {"justify": "right"}),
+                       ("$ a day used", {"justify": "right"}), ("", {"ratio": 1})]:
+        t.add_column(up(name), no_wrap=True, **opts)
+    keys = sorted(months, reverse=True)[:max(1, height - 8 - len(chart))]
+    top_month = max((months[k].usd for k in keys), default=0) or 1
+    for k in keys:
+        m, n = months[k], len(month_days[k])
+        label = dt.date(k[0], k[1], 1).strftime("%Y-%m") + (up(" (so far)") if k == (now.year, now.month) else "")
+        t.add_row(label, m.money(), tok(m.total), str(round(m.n)), str(n), money(m.usd / n if n else 0),
+                  bar(m.usd / top_month, 16, look.accent))
+    title = lambda name: Text(f" {name} ", style=f"bold {look.accent}")
+    if dash:
+        return [Panel(Group(*chart), title=summary, title_align="left", box=box.ROUNDED, border_style=look.accent),
+                Panel(t, title=title("By month"), title_align="left", box=box.ROUNDED, border_style=look.accent)]
+    return [summary, "", *chart, "", Text((" > " if look.caps else " ") + up("By month"), style="bold"), t]
 
 
 # ---------------------------------------------------------------- the screen
@@ -1376,6 +1556,9 @@ def render(reader, ui, now, width, height):
         keys = "←/→ page   t theme   ^C quit"
     elif ui.page == SPEND:
         body = spend_page(reader, ui, look, now, width, height - 2)
+        keys = "←/→ page   t theme   ^C quit"
+    elif ui.page == HISTORY:
+        body = history_page(reader, ui, look, now, width, height - 2)
         keys = "←/→ page   t theme   ^C quit"
     elif ui.detail:
         body = session_page(reader, ui, look, now, width, height - 2)

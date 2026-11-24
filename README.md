@@ -14,16 +14,21 @@ on your machine, so nothing is sent anywhere. Built to sit in a quarter of your 
 
 - **Overview**: today, this week, a projection to Sunday at your current pace, and meters for the
   5-hour limit ("Current session" in `/usage`) and the weekly limit, each with an estimate of what is
-  left and **when it runs out at your recent pace** ("runs out ~15:09, 36m before it resets"). The
-  Dashboard theme adds a chart of what you spent over the last 6 hours.
-- **Alerts**: a desktop notification when a limit passes 80% and 90%, and when it is on course to run
-  out before it resets. Each one once per limit window.
+  left and **when it runs out at your recent pace** ("runs out ~15:09, 36m before it resets"). The ┃ on
+  a meter is now, how much of the window has gone by; when the fill passes it, you are using the limit
+  faster than time. Each active session shows what one request costs at its context size, with a ⚠
+  once the context passes 400k tokens. The Dashboard theme adds a chart of what you spent over the
+  last 6 hours.
+- **Alerts**: a desktop notification when a limit passes 80% and 90%, when it is on course to run
+  out before it resets, and when a session's context passes 400k and 700k tokens. Each one once.
 - **Today / Week / All time**: every project, sorted by cost. Open a project to see each session by
   its title, with its model, first and last use, requests, tokens and cost.
 - **A session in detail**: press Enter on a session for the cost of each request and the context it
   sent over time, its most expensive requests, and how often its cache had to be rebuilt.
-- **Spend**: where the money went, today / this week / all time, by model and by what was paid for
-  (input, cache writes, cache reads, output), and what cache rebuilds after a pause cost.
+- **Spend**: how many points of each limit each project used; where the money went, today / this
+  week / all time, by model and by what was paid for (input, cache writes, cache reads, output); and
+  what cache rebuilds after a pause cost.
+- **History**: the last 30 days as a bar chart, and every month's totals.
 - **Three themes**: Hero (one big figure), Dashboard (panels and a chart), Amber (a CRT look that
   paints its own background). The theme you close it on opens next time. See [Themes](#themes).
 - The layout follows the window: about 80×24 is enough, and wider windows get more columns.
@@ -39,6 +44,10 @@ Press `t` to switch. All three show the same numbers.
 | A session in detail | Spend |
 |---|---|
 | ![A session's own page](docs/session.png) | ![The Spend page](docs/spend.png) |
+
+| History | |
+|---|---|
+| ![The History page](docs/history.png) | |
 
 ## Requirements
 
@@ -93,7 +102,7 @@ No other key does anything, and nothing you type is shown or left behind for you
 ## Options
 
 ```bash
-python3 cc_usage.py --page week      # start on another page: overview, today, week, all, spend
+python3 cc_usage.py --page week      # start on another page: overview, today, week, all, spend, history
 python3 cc_usage.py --theme amber    # start with another theme: hero, dash, amber
 python3 cc_usage.py --once           # print one screen and exit
 python3 cc_usage.py --every 5        # read the transcripts every 5 s instead of 2
@@ -133,6 +142,11 @@ set the variable for both `cc_usage.py` (your shell) and the mod (the `env` bloc
 - **The pace** is what you spent over the last 30 minutes (5-hour limit) or 24 hours (weekly limit),
   against that estimate, carried forward. It waits until a window is 15 minutes (or 6 hours) old and
   10% used: before that a 1% step in the reading would swing the prediction wildly.
+- **Per request** is the average cost of a session's last five main-thread requests. Every request
+  sends the whole conversation, so it grows with the context; past 400k tokens (`CONTEXT_WARN`) the
+  session is marked, and `/compact` or a new session brings it down.
+- **Limits by project** divide what each project spent inside a limit's window by the window's
+  estimated allowance, so the rows add up to roughly the % used.
 - **A cache rebuild** is a request, after a session's first, that had to write most of its prompt to
   the cache again: the cache had expired, usually after a pause. Writing costs more than reading, so
   these show up as spikes.

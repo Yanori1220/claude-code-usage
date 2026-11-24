@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Draws the README's screenshots (docs/<theme>.png) from made-up sessions, so no real usage is shown.
 
-    python3 docs/make_screenshot.py              # dash, hero, amber, spend and session
+    python3 docs/make_screenshot.py              # dash, hero, amber, spend, session and history
     python3 docs/make_screenshot.py dash         # one of them
 
 Needs Pillow and the DejaVu fonts. Each terminal cell is painted at a fixed place, and the
@@ -25,7 +25,7 @@ from rich.console import Console
 from rich.style import Style
 
 HERE = Path(__file__).resolve().parent
-COLS, ROWS = 100, 24
+COLS, ROWS = 100, 31
 SCALE = 2  # drawn at twice the size, so it stays sharp on high-density screens
 FONTS = Path("/usr/share/fonts/truetype/dejavu")
 BG, FG = (0x16, 0x18, 0x1D), (0xD6, 0xDA, 0xE1)  # a dark terminal
@@ -34,6 +34,15 @@ SESSIONS = [  # project, title, model, days ago
     ("my-app", "Fix flaky tests", "claude-fable-5-2", 0),
     ("notes-site", "Dark mode toggle", "claude-opus-5-5", 0),
     ("notes-site", "Initial layout", "claude-sonnet-5-5", 8),
+] + [  # earlier days, so the History page has a month to show
+    (project, title, model, days)
+    for days, project, title, model in [
+        (1, "my-app", "Rate limiter", "claude-opus-5-5"), (2, "notes-site", "Search index", "claude-opus-5-5"),
+        (4, "my-app", "Email templates", "claude-sonnet-5-5"), (6, "my-app", "CI cache", "claude-fable-5-2"),
+        (9, "notes-site", "Tag pages", "claude-opus-5-5"), (12, "my-app", "Billing webhooks", "claude-opus-5-5"),
+        (15, "notes-site", "RSS feed", "claude-sonnet-5-5"), (19, "my-app", "Admin panel", "claude-fable-5-2"),
+        (23, "my-app", "Upgrade deps", "claude-opus-5-5"), (27, "notes-site", "First draft", "claude-sonnet-5-5"),
+    ]
 ]
 
 
@@ -149,7 +158,7 @@ class Painter:
 
 
 def main():
-    shots = sys.argv[1:] or ["dash", "hero", "amber", "spend", "session"]
+    shots = sys.argv[1:] or ["dash", "hero", "amber", "spend", "session", "history"]
     now = dt.datetime.now(dt.timezone.utc)
     with tempfile.TemporaryDirectory() as tmp:
         root, data = Path(tmp) / "projects", Path(tmp) / "data"
@@ -163,7 +172,7 @@ def main():
         painter = Painter()
         for shot in shots:
             theme = shot if shot in cu.THEMES else "dash"
-            ui = cu.UI(cu.SPEND if shot == "spend" else 3 if shot == "session" else 0, theme)
+            ui = cu.UI({"spend": cu.SPEND, "history": cu.HISTORY, "session": 3}.get(shot, 0), theme)
             ui.background = BG  # tells the charts they are on a dark background
             if shot == "session":  # the session with the most cache rebuilds, so the page shows one
                 recs = list(reader.recs.values())
