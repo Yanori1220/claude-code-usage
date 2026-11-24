@@ -1,0 +1,5 @@
+{
+  "name": "cc-usage-limits",
+  "version": "0.1.0",
+  "description": "Writes the account's rate-limit readings (five_hour, seven_day) to $CC_USAGE_DIR/ratelimits.json (default ~/cc-usage) for cc_usage.py"
+}

@@ -1,0 +1,6 @@
+# written while it runs
+ratelimits.json
+state.json
+__pycache__/
+# local only
+aliases.json
