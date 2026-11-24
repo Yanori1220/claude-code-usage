@@ -659,7 +659,7 @@ def nice_ceiling(x):
     return next(m * step for m in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10) if x <= m * step + 1e-12)
 
 
-def activity_chart(recs, now, width, height, look, hours=6):
+def activity_chart(recs, now, width, height, look, hours=6, dark=False):
     """An area chart of $ per bucket over the last `hours`, with a $ axis on the left and clock times below.
 
     Returns (lines, bucket minutes, peak $). `width` and `height` count the plot and its axes."""
@@ -670,7 +670,9 @@ def activity_chart(recs, now, width, height, look, hours=6):
     vals = activity(recs, now, n, hours)
     peak = max(vals)
     top = nice_ceiling(peak)
-    ramp = [BLUES[min(i, len(BLUES) - 1)] for i in range(rows)] if look.accent == ACCENT else [look.accent] * rows
+    # more is darker on a light background and brighter on a dark one, so the peaks stand out on both
+    blues = BLUES[::-1] if dark else BLUES
+    ramp = [blues[min(i, len(blues) - 1)] for i in range(rows)] if look.accent == ACCENT else [look.accent] * rows
     plot = braille([v / top for v in vals], plot_w, rows, ramp)
     ticks = {0: top, rows // 2: top * (1 - (rows // 2) / rows)}
     lines = []
@@ -752,7 +754,7 @@ def overview_dash(d, look, width, height):
     side = min(40, max(30, width // 3))
     gh = 6
     gw = max(18, width - side - 6)
-    lines, bucket, peak = activity_chart(d.recs, d.now, gw, gh + 2, look)
+    lines, bucket, peak = activity_chart(d.recs, d.now, gw, gh + 2, look, dark=d.dark)
     title = lambda s: Text(f" {s} ", style=f"bold {look.accent}")
     panel = lambda body, name, h: Panel(body, title=title(name), title_align="left", box=box.ROUNDED,
                                          border_style=look.accent, height=h)
@@ -1048,7 +1050,10 @@ def render(reader, ui, now, width, height):
     if look.frame:  # a double border and one column of padding each side, all of it painted
         width, height = width - 4, height - 2
     if ui.page == 0:
-        body = OVERVIEWS[ui.theme](gather(reader, now), look, width, height - 2)
+        d = gather(reader, now)
+        bg = ui.background
+        d.dark = bg is not None and 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2] < 128  # unknown: light
+        body = OVERVIEWS[ui.theme](d, look, width, height - 2)
         keys = "←/→ page   t theme   ^C quit"
     else:
         body = project_page(reader, ui, look, now, width, height - 2)

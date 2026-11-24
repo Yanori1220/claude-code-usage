@@ -6,30 +6,9 @@ on your machine, so nothing is sent anywhere. Built to sit in a quarter of your 
 
 > Unofficial. Not affiliated with or endorsed by Anthropic.
 
-```
- Overview   Today   Week   All time                                             Dashboard · 13:28:32
-╭─  activity · $ spent per 3.4 min · peak $1.10  ───────────────╮╭─  budget  ──────────────────────╮
-│  $1.20 ┤                                             ⢠   ⡄    ││ today        $19.21   35.3M tok │
-│        │                                             ⣿   ⣷    ││ this week    $19.21   35.3M tok │
-│        │                                 ⡀           ⣿  ⢀⣿    ││ by sunday   ~$86.12 ~158.4M tok │
-│  $0.60 ┤          ⢀⣤              ⢀   ⣴ ⢠⣇        ⢰ ⢠⣿  ⢸⣿    ││ limit left   $60.83      111.9M │
-│        │      ⣼   ⢸⣿⣰⢰  ⢀⢰ ⣧    ⡀⢸⢸   ⣿ ⢸⣿⡄       ⣼ ⢸⣿  ⢸⣿ ⢰⡀ ││                                 │
-│        │  ⡄⢠  ⣿  ⣿⢸⣿⣿⢸⢰⢀⢸⣸⣤⣿⢠⣴⢠⣤⣷⣼⢸⣦⢸⢠⣿⡄⣼⣿⡇⢠⢸⢠⡀⡄ ⣼⣿⡆⢸⣿  ⢸⣿⡄⣼⡇ ││ weekly limit                24% │
-│     $0 └────┴────────┴────────┴────────┴───────┴────────┴──── ││ ━━━━━━━─────────┃────────────   │
-│           08:00    09:00    10:00    11:00   12:00    13:00   ││ resets Fri 11:28 · in 2d 21h    │
-╰───────────────────────────────────────────────────────────────╯╰─────────────────────────────────╯
-╭─  current session  ───────────────────────────────────────────╮╭─  week  ────────────────────────╮
-│ 5-hour limit                                         37% used ││     ███                         │
-│ ━━━━━━━━━━━━━━━━━━━━━━━──────────────────┃─────────────────── ││     ███                         │
-│ resets 15:05 · in 1h 36m · ~$22.41 left ┃ 68% of the 5 h gone ││     ███                         │
-╰───────────────────────────────────────────────────────────────╯│     ███                         │
-╭─  sessions · last 30 min  ────────────────────────────────────╮│ Mon Tue Wed Thu Fri Sat Sun     │
-│ Add OAuth login                 Opus 5.5 ━━━─────── 33% $8.11 ││ today $19.21  ·  week $19.21    │
-│ Fix flaky tests                 Opus 5.5 ━━──────── 18% $3.54 ││                                 │
-╰───────────────────────────────────────────────────────────────╯╰─────────────────────────────────╯
-```
+![The Dashboard theme](docs/dash.png)
 
-<sub>The Dashboard theme at 100×21, drawn from made-up sessions.</sub>
+<sub>The Dashboard theme, drawn from made-up sessions.</sub>
 
 ## What it shows
 
@@ -39,8 +18,16 @@ on your machine, so nothing is sent anywhere. Built to sit in a quarter of your 
 - **Today / Week / All time**: every project, sorted by cost. Open a project to see each session by
   its title, with its model, first and last use, requests, tokens and cost.
 - **Three themes**: Hero (one big figure), Dashboard (panels and a chart), Amber (a CRT look that
-  paints its own background). The theme you close it on opens next time.
+  paints its own background). The theme you close it on opens next time. See [Themes](#themes).
 - The layout follows the window: about 80×24 is enough, and wider windows get more columns.
+
+## Themes
+
+Press `t` to switch. All three show the same numbers.
+
+| Hero | Amber |
+|---|---|
+| ![The Hero theme](docs/hero.png) | ![The Amber theme](docs/amber.png) |
 
 ## Requirements
 
@@ -99,6 +86,9 @@ python3 cc_usage.py --theme amber    # start with another theme: hero, dash, amb
 python3 cc_usage.py --once           # print one screen and exit
 python3 cc_usage.py --every 5        # read the transcripts every 5 s instead of 2
 ```
+
+The screenshots come from `python3 docs/make_screenshot.py` (needs Pillow), which draws them from
+made-up sessions.
 
 ## Files
 
