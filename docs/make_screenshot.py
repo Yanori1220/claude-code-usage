@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Draws the README's screenshots (docs/<theme>.png) from made-up sessions, so no real usage is shown.
 
-    python3 docs/make_screenshot.py              # dash, hero and amber
-    python3 docs/make_screenshot.py dash         # one theme
+    python3 docs/make_screenshot.py              # dash, hero, amber, spend and session
+    python3 docs/make_screenshot.py dash         # one of them
 
 Needs Pillow and the DejaVu fonts. Each terminal cell is painted at a fixed place, and the
 braille chart dots and the block bars are drawn as shapes, so the picture lines up whatever
@@ -29,32 +29,45 @@ COLS, ROWS = 100, 24
 SCALE = 2  # drawn at twice the size, so it stays sharp on high-density screens
 FONTS = Path("/usr/share/fonts/truetype/dejavu")
 BG, FG = (0x16, 0x18, 0x1D), (0xD6, 0xDA, 0xE1)  # a dark terminal
-SESSIONS = [("my-app", "Add OAuth login"), ("my-app", "Fix flaky tests"), ("notes-site", "Dark mode toggle")]
+SESSIONS = [  # project, title, model, days ago
+    ("my-app", "Add OAuth login", "claude-opus-5-5", 0),
+    ("my-app", "Fix flaky tests", "claude-fable-5-2", 0),
+    ("notes-site", "Dark mode toggle", "claude-opus-5-5", 0),
+    ("notes-site", "Initial layout", "claude-sonnet-5-5", 8),
+]
 
 
 def made_up(root, data, now):
     """Transcripts for three sessions over the last few hours, and a limits file."""
     random.seed(7)
     prefix = str(Path.home()).replace("/", "-") + "-"
-    for project, title in SESSIONS:
+    for project, title, model, days_ago in SESSIONS:
         sid = str(uuid.UUID(int=random.getrandbits(128)))
         folder = root / (prefix + project)
         folder.mkdir(parents=True, exist_ok=True)
         lines = [json.dumps({"type": "ai-title", "aiTitle": title, "sessionId": sid})]
-        t = now - dt.timedelta(hours=random.uniform(4.5, 5.8))
+        end = now - dt.timedelta(days=days_ago)
+        t = end - dt.timedelta(hours=random.uniform(4.5, 5.8))
         context = 30_000
-        while t < now:
+        paused = False
+        while t < end:
             for _ in range(random.randint(3, 12) if random.random() < 0.25 else random.randint(1, 3)):
                 context += random.randint(500, 6000)
-                write = random.randint(500, 8000)
+                write = context if paused else random.randint(500, 8000)  # after a long pause the cache is cold
+                paused = False
                 usage = {"input_tokens": 2, "cache_creation_input_tokens": write, "cache_read_input_tokens": context,
                          "output_tokens": random.randint(100, 2500),
                          "cache_creation": {"ephemeral_1h_input_tokens": write, "ephemeral_5m_input_tokens": 0}}
+                usage["cache_read_input_tokens"] = context - write
                 lines.append(json.dumps({
                     "type": "assistant", "timestamp": t.isoformat(), "requestId": str(uuid.uuid4()),
-                    "message": {"id": str(uuid.uuid4()), "model": "claude-opus-5-5", "usage": usage}}))
+                    "message": {"id": str(uuid.uuid4()), "model": model, "usage": usage}}))
                 t += dt.timedelta(seconds=random.randint(10, 60))
-            t += dt.timedelta(minutes=random.uniform(2, 25))
+            if random.random() < 0.08:
+                t += dt.timedelta(minutes=70)  # a pause longer than the cache lasts
+                paused = True
+            else:
+                t += dt.timedelta(minutes=random.uniform(2, 25))
         (folder / f"{sid}.jsonl").write_text("\n".join(lines) + "\n")
     data.mkdir(parents=True, exist_ok=True)
     (data / "ratelimits.json").write_text(json.dumps({"at": int(now.timestamp() * 1000), "rateLimits": [
@@ -136,7 +149,7 @@ class Painter:
 
 
 def main():
-    themes = sys.argv[1:] or ["dash", "hero", "amber"]
+    shots = sys.argv[1:] or ["dash", "hero", "amber", "spend", "session"]
     now = dt.datetime.now(dt.timezone.utc)
     with tempfile.TemporaryDirectory() as tmp:
         root, data = Path(tmp) / "projects", Path(tmp) / "data"
@@ -148,15 +161,21 @@ def main():
         reader = cu.Reader(root)
         reader.poll()
         painter = Painter()
-        for theme in themes:
-            ui = cu.UI(0, theme)
-            ui.background = BG  # tells the chart it is on a dark background
+        for shot in shots:
+            theme = shot if shot in cu.THEMES else "dash"
+            ui = cu.UI(cu.SPEND if shot == "spend" else 3 if shot == "session" else 0, theme)
+            ui.background = BG  # tells the charts they are on a dark background
+            if shot == "session":  # the session with the most cache rebuilds, so the page shows one
+                recs = list(reader.recs.values())
+                rebuilt = cu.rebuilds(recs)
+                r = max(recs, key=lambda r: (sum(id(x) in rebuilt for x in recs if x.session == r.session), r.usd))
+                ui.detail = (r.project, r.session)
             screen = cu.render(reader, ui, now.astimezone(), COLS, ROWS)
             console = Console(width=COLS, height=ROWS, file=io.StringIO(), color_system="truecolor", force_terminal=True)
             lines = console.render_lines(screen, console.options.update(width=COLS, height=ROWS), pad=True)
             frame = cu.THEMES[theme].frame
-            painter.paint(lines, HERE / f"{theme}.png", rgb(Style.parse(frame).bgcolor, BG) if frame else BG)
-            print(f"wrote docs/{theme}.png")
+            painter.paint(lines, HERE / f"{shot}.png", rgb(Style.parse(frame).bgcolor, BG) if frame else BG)
+            print(f"wrote docs/{shot}.png")
 
 
 if __name__ == "__main__":

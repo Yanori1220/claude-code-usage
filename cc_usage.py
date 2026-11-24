@@ -47,7 +47,9 @@ import math
 import os
 import re
 import select
+import shutil
 import signal
+import subprocess
 import sys
 import termios
 import time
@@ -70,7 +72,7 @@ from rich.text import Text
 ROOT = Path.home() / ".claude" / "projects"
 DATA = Path(os.environ.get("CC_USAGE_DIR") or Path.home() / "cc-usage")  # the mod reads the same variable
 LIMITS = DATA / "ratelimits.json"  # written by the cc-usage-limits mod
-STATE = DATA / "state.json"  # the theme it was last closed on
+STATE = DATA / "state.json"  # the theme it was last closed on, and the alerts already sent
 ACTIVE_MIN = 30  # a session is shown as active if it got a response in the last N minutes
 
 
@@ -113,8 +115,9 @@ FAST = 2.0  # fast mode costs twice the standard price on every model that has i
 WEEKDAY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 WEEK = dt.timedelta(days=7)
 FIVE_HOURS = dt.timedelta(hours=5)  # the "Current session" window in /usage
-PAGES = ["Overview", "Today", "Week", "All time"]
-PAGE_ARGS = {"overview": 0, "today": 1, "week": 2, "all": 3}
+PAGES = ["Overview", "Today", "Week", "All time", "Spend"]
+PAGE_ARGS = {"overview": 0, "today": 1, "week": 2, "all": 3, "spend": 4}
+SPEND = 4
 
 
 def base_model(model):
@@ -139,6 +142,7 @@ class Rec:
     out: int  # output, thinking included
     ws: int  # web searches
     usd: float | None = None  # None: no price for this model
+    parts: dict | None = None  # $ by what was paid for: input, cache write, cache read, output, web search
 
     @property
     def sent(self):
@@ -146,7 +150,11 @@ class Rec:
         return self.inp + self.cw5 + self.cw1h + self.cr
 
 
-def cost(r):
+PAID_FOR = ["input", "cache write", "cache read", "output", "web search"]
+
+
+def cost_parts(r):
+    """$ by what was paid for, or None for a model with no price."""
     model = base_model(r.model)
     if model not in PRICES:
         return None
@@ -156,8 +164,14 @@ def cost(r):
         read = None
     if read is None:
         read = inp * 0.1
-    per_million = r.inp * inp + r.cw5 * inp * 1.25 + r.cw1h * inp * 2 + r.cr * read + r.out * out
-    return (FAST if r.speed == "fast" else 1.0) * per_million / 1e6 + r.ws * WEB_SEARCH
+    f = (FAST if r.speed == "fast" else 1.0) / 1e6
+    return {"input": r.inp * inp * f, "cache write": (r.cw5 * 1.25 + r.cw1h * 2) * inp * f,
+            "cache read": r.cr * read * f, "output": r.out * out * f, "web search": r.ws * WEB_SEARCH}
+
+
+def cost(r):
+    parts = cost_parts(r)
+    return None if parts is None else sum(parts.values())
 
 
 def first_typed(d):
@@ -288,7 +302,8 @@ class Reader:
             out=out,
             ws=(u.get("server_tool_use") or {}).get("web_search_requests") or 0,
         )
-        r.usd = cost(r)
+        r.parts = cost_parts(r)
+        r.usd = None if r.parts is None else sum(r.parts.values())
         self.recs[key] = r
 
 
@@ -354,20 +369,31 @@ THEMES = {
 THEME_TITLES = {"hero": "Hero", "dash": "Dashboard", "amber": "Amber"}
 
 
-def load_theme():
+def load_state():
     try:
-        theme = json.loads(STATE.read_text()).get("theme")
-    except (OSError, ValueError, AttributeError):
-        theme = None
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_state(**changes):
+    state = load_state()
+    state.update(changes)
+    try:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state) + "\n")
+    except OSError:
+        pass
+
+
+def load_theme():
+    theme = load_state().get("theme")
     return theme if theme in THEMES else "hero"
 
 
 def save_theme(theme):
-    try:
-        STATE.parent.mkdir(parents=True, exist_ok=True)
-        STATE.write_text(json.dumps({"theme": theme}) + "\n")
-    except OSError:
-        pass
+    save_state(theme=theme)
 
 
 def tok(n):
@@ -397,7 +423,7 @@ def until(td):
     minutes = int(td.total_seconds() // 60)
     days, minutes = divmod(minutes, 24 * 60)
     hours, minutes = divmod(minutes, 60)
-    return f"{days}d {hours}h" if days else f"{hours}h {minutes}m"
+    return f"{days}d {hours}h" if days else f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
 @dataclass
@@ -569,6 +595,27 @@ def limit_info(recs, now, kind="seven_day", span=WEEK):
     start = reset - span
     used = Sum.of(r for r in recs if r.ts >= start)
     allowance = Sum.of(r for r in recs if start <= r.ts <= read_at).scaled(100 / pct) if pct >= 1 else None
+    # the pace: % per hour over the recent stretch (the last 30 min of a 5-hour window, the last
+    # 24 h of the week), from $ spent against the allowance; without an allowance, the window's average
+    recent = dt.timedelta(minutes=30) if span == FIVE_HOURS else dt.timedelta(hours=24)
+    since = max(start, now - recent)
+    hours = max((now - since).total_seconds() / 3600, 1 / 60)
+    if allowance and allowance.usd > 0:
+        rate = sum(r.usd or 0 for r in recs if r.ts >= since) / allowance.usd * 100 / hours
+        pct_now = max(pct, used.usd / allowance.usd * 100)
+    else:
+        rate = pct / max((now - start).total_seconds() / 3600, 1 / 60)
+        pct_now = pct
+    # too early to tell: a window just begun, or so little used that a 1% step in the reading moves the
+    # allowance by a tenth or more, would predict wildly (a new 5-hour window "running out" in minutes)
+    early = dt.timedelta(minutes=15) if span == FIVE_HOURS else dt.timedelta(hours=6)
+    if pct < 10 or now - start < early:
+        rate = None
+    runout = None
+    if pct_now >= 100:
+        runout = now
+    elif rate:
+        runout = now + dt.timedelta(hours=(100 - pct_now) / rate)
     return {
         "pct": pct,
         "reset": reset,
@@ -576,7 +623,35 @@ def limit_info(recs, now, kind="seven_day", span=WEEK):
         "gone": (now - start) / span,
         "allowance": allowance,
         "left": allowance.minus(used) if allowance else None,
+        "rate": rate,
+        "recent": "30 min" if span == FIVE_HOURS else "24 h",
+        "runout": runout if runout and runout < reset else None,
+        "at_reset": None if rate is None else pct_now + rate * (reset - now).total_seconds() / 3600,
     }
+
+
+def pace_text(info, look, caps=False, width=None):
+    """One line: when the window runs out at the recent pace, or where it ends up at reset.
+    With `width`, padded to it, so it lines up with the meter above when centred."""
+    t = _pace_text(info, look, caps)
+    if width:
+        t.truncate(width, overflow="ellipsis", pad=True)
+    return t
+
+
+def _pace_text(info, look, caps):
+    up = (lambda x: x.upper()) if caps else (lambda x: x)
+    if info["runout"]:
+        early = info["reset"] - info["runout"]
+        text = f"⚠ at the last {info['recent']}'s pace it runs out ~{info['runout']:%H:%M}, {until(early)} before it resets"
+        return Text(up(text), style=f"bold {look.danger if early > dt.timedelta(hours=1) else look.warn}",
+                    no_wrap=True, overflow="ellipsis")
+    if info["rate"] is None:
+        return Text(up("too early in the window to tell the pace"), style=look.muted, no_wrap=True, overflow="ellipsis")
+    if info["rate"] <= 0:
+        return Text(up(f"nothing used in the last {info['recent']}"), style=look.muted, no_wrap=True, overflow="ellipsis")
+    return Text(up(f"at the last {info['recent']}'s pace: ~{min(info['at_reset'], 100):.0f}% used when it resets"),
+                style=look.muted, no_wrap=True, overflow="ellipsis")
 
 
 def active_sessions(recs, now):
@@ -628,7 +703,8 @@ def limit_block(info, reason, label, look, width, now, window, wrap=lambda x: x)
     return [wrap(grid2(Text(label, style=look.muted), Text(f"{pct:g}% used", style="bold"), width=width)),
             wrap(meter(pct / 100, width, look, gone)),
             wrap(grid2(Text(detail, style=look.muted), Text(f"┃ {gone:.0%} of the {window} gone", style=look.muted),
-                       width=width))]
+                       width=width)),
+            wrap(pace_text(info, look, width=width))]
 
 
 def amber_limit(label, info, reason, window, look, width, now):
@@ -642,7 +718,8 @@ def amber_limit(label, info, reason, window, look, width, now):
     at = f"{WEEKDAY[reset.weekday()]} {reset:%H:%M}" if window == "week" else f"{reset:%H:%M}"
     detail = f"  resets {at} · in {until(reset - now)}   ·   ┃ {gone:.0%} of {window} elapsed"
     detail += f"   ·   ~{left.money()} left" if left else ""
-    return [line, Text(detail.upper(), style=AMBER_DIM, no_wrap=True, overflow="ellipsis")]
+    pace = pace_text(info, look, caps=True)
+    return [line, Text(detail.upper(), style=AMBER_DIM, no_wrap=True, overflow="ellipsis"), Text("  ") + pace]
 
 
 def reset_text(d):
@@ -720,33 +797,36 @@ def activity(recs, now, n, hours):
 def overview_hero(d, look, width, height):
     c = Align.center
     mw = max(30, min(84, width - 16))
+    gap = [""] * (2 if height >= 28 else 1)  # the space between blocks shrinks before anything is left out
     parts = [c(Text("T O D A Y", style=look.muted)), "", c(big(d.today.money(), f"bold {look.accent}")), "",
              c(Text(f"{tok(d.today.total)} tokens   ·   {round(d.today.n)} requests   ·   {len(d.active)} active now",
-                    style=look.muted)), "", ""]
-    parts += limit_block(d.limit, d.info, "weekly limit", look, mw, d.now, "week", c)
-    stats = Table.grid(padding=(0, 4))
-    for _ in range(5):
-        stats.add_column(justify="center", no_wrap=True)
-    cells = []
-    for label, value, sub in kpis(d):
-        t = Text(label.lower() + "\n", style=look.muted)
-        t.append(value + "\n", style="bold")
-        t.append(sub, style=look.muted)
-        cells += [t, Text("│\n│\n│", style=look.muted)]
-    stats.add_row(*cells[:-1])
-    parts += ["", "", c(stats)]
-    session = limit_block(d.slimit, d.sinfo, "current session · 5-hour limit", look, mw, d.now, "5 h", c)
-    parts[7:7] = [*session, "", ""]  # after the today line
-    room = height - 26  # what is left for the sessions
-    if d.active and room >= 3:
+                    style=look.muted)), *gap]
+    parts += limit_block(d.slimit, d.sinfo, "current session · 5-hour limit", look, mw, d.now, "5 h", c)
+    parts += [*gap, *limit_block(d.limit, d.info, "weekly limit", look, mw, d.now, "week", c)]
+    used = len(parts) + 2  # the figure is three lines tall
+    if height - used >= len(gap) + 3:
+        stats = Table.grid(padding=(0, 4))
+        for _ in range(5):
+            stats.add_column(justify="center", no_wrap=True)
+        cells = []
+        for label, value, sub in kpis(d):
+            t = Text(label.lower() + "\n", style=look.muted)
+            t.append(value + "\n", style="bold")
+            t.append(sub, style=look.muted)
+            cells += [t, Text("│\n│\n│", style=look.muted)]
+        stats.add_row(*cells[:-1])
+        parts += [*gap, c(stats)]
+        used += len(gap) + 3
+    room = height - used - len(gap)  # what is left for the sessions
+    if d.active and room >= 1:
         g = Table.grid(padding=(0, 3))
         g.width = mw
         g.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         for _ in range(3):
             g.add_column(no_wrap=True, justify="right")
-        for title, _, frac, s in d.active[:room - 2]:
+        for title, _, frac, s in d.active[:room]:
             g.add_row(Text(title, style=look.muted), meter(frac or 0, 12, look), f"{(frac or 0):.0%}", s.money())
-        parts += ["", "", c(g)]
+        parts += [*gap, c(g)]
     return [Align.center(Group(*parts), vertical="middle", height=height)]
 
 
@@ -769,13 +849,14 @@ def overview_dash(d, look, width, height):
     st.add_row("today", d.today.money(), f"{tok(d.today.total)} tok")
     for label, value, sub in kpis(d):
         st.add_row(label.lower(), value, sub.split(" / ")[0])
-    budget = [st, ""]
+    budget = [st]
     if d.limit:
         pct = d.limit["pct"]
         budget += [grid2(Text("weekly limit", style=look.muted), Text(f"{pct:g}%", style="bold")),
-                   meter(pct / 100, side - 4, look, d.limit["gone"]), Text(reset_text(d), style=look.muted)]
+                   meter(pct / 100, side - 4, look, d.limit["gone"]), Text(reset_text(d), style=look.muted),
+                   pace_text(d.limit, look)]
     else:
-        budget.append(Text(f"weekly limit: {d.info}", style=look.muted))
+        budget += ["", Text(f"weekly limit: {d.info}", style=look.muted)]
 
     bottom = max(6, height - (gh + 4))
     ses = Table.grid(expand=True, padding=(0, 1))
@@ -784,7 +865,7 @@ def overview_dash(d, look, width, height):
     ses.add_column(no_wrap=True)
     ses.add_column(no_wrap=True, justify="right")
     ses.add_column(no_wrap=True, justify="right")
-    cur_h = 5
+    cur_h = 6
     ses_h = max(3, bottom - cur_h)
     for t, model, frac, s in d.active[:ses_h - 2]:
         ses.add_row(t, model, meter(frac or 0, 10, look), f"{(frac or 0):.0%}", s.money())
@@ -826,7 +907,7 @@ def overview_amber(d, look, width, height):
     parts += ["", *amber_limit("CURRENT SESSION", d.slimit, d.sinfo, "5 h", look, width, d.now),
               "", *amber_limit("WEEKLY LIMIT", d.limit, d.info, "week", look, width, d.now)]
     parts += ["", Text("> ACTIVE PROCESSES", style=AMBER)]
-    room = max(1, height - 20)
+    room = max(1, height - 22)
     for n, (title, model, frac, s) in enumerate(d.active[:room], 1):
         name = Text(title, style=AMBER)
         name.truncate(max(10, width - 52), overflow="ellipsis", pad=True)
@@ -867,6 +948,12 @@ class UI:
         self.view = 10  # rows that fit on screen, as last drawn
         self.background = None  # the terminal's own background, (r, g, b), when it said
         self.live = False  # --once draws no picked row
+        self.detail = None  # (project, session) open on its own page, from a project list
+
+    @property
+    def dark(self):
+        bg = self.background
+        return bg is not None and 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2] < 128  # unknown: light
 
     def pick_style(self):
         """(row style, share-bar colour) of the picked row."""
@@ -886,20 +973,27 @@ class UI:
     def key(self, k):
         if k in ("left", "right"):
             self.page = (self.page + (1 if k == "right" else -1)) % len(PAGES)
+            self.detail = None
             return
         if k == "theme":
             names = list(THEMES)
             self.theme = names[(names.index(self.theme) + 1) % len(names)]
             save_theme(self.theme)
             return
+        if self.detail is not None:
+            if k in ("enter", "back"):
+                self.detail = None
+            return
         rows = self.rows.get(self.page)
-        if not rows or self.page == 0:
+        if not rows or self.page in (0, SPEND):
             return
         i = self.index()
         if k == "enter":
-            kind, project, _ = rows[i]
+            kind, project, session = rows[i]
             if kind == "p":
                 self.open ^= {project}
+            else:
+                self.detail = (project, session)
             return
         i = {"up": i - 1, "down": i + 1, "pgup": i - self.view, "pgdn": i + self.view,
              "home": 0, "end": len(rows) - 1}.get(k, i)
@@ -1031,6 +1125,230 @@ def project_page(reader, ui, look, now, width, height):
     return [grid2(summary, scroll), t]
 
 
+# ---------------------------------------------------------------- alerts
+
+
+def notify(title, body, urgent=False):
+    """A desktop notification: notify-send on Linux, osascript on macOS; nothing where neither is there."""
+    try:
+        if shutil.which("notify-send"):
+            cmd = ["notify-send", "-a", "cc-usage", "-u", "critical" if urgent else "normal", title, body]
+        elif shutil.which("osascript"):
+            cmd = ["osascript", "-e", f"display notification {json.dumps(body)} with title {json.dumps(title)}"]
+        else:
+            return
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+class Alerts:
+    """Each alert once per limit window: past 80%, past 90%, and on course to run out before it resets.
+    What was sent is kept in state.json, so a restart does not send it again."""
+
+    WINDOWS = [("five_hour", FIVE_HOURS, "5-hour limit"), ("seven_day", WEEK, "Weekly limit")]
+
+    def __init__(self, enabled=True, send=notify):
+        self.enabled = enabled
+        self.send = send
+        self.sent = set(load_state().get("alerts", []))
+
+    def check(self, reader, now):
+        if not self.enabled:
+            return
+        recs = list(reader.recs.values())
+        fired = []
+        for kind, span, label in self.WINDOWS:
+            info = limit_info(recs, now, kind, span)
+            if not isinstance(info, dict):
+                continue
+            reset = info["reset"]
+            base = f"{kind}@{int(reset.timestamp())}"
+            at = f"{WEEKDAY[reset.weekday()]} {reset:%H:%M}" if span == WEEK else f"{reset:%H:%M}"
+            reached = [th for th in (80, 90) if info["pct"] >= th and f"{base}:{th}" not in self.sent]
+            if reached:  # past both at once: one notice, the higher one
+                fired.append(([f"{base}:{th}" for th in reached], f"{label}: {info['pct']:g}% used",
+                              f"Resets {at} (in {until(reset - now)}).", max(reached) >= 90))
+            if info["runout"] and f"{base}:runout" not in self.sent:
+                early = until(reset - info["runout"])
+                fired.append(([f"{base}:runout"], f"{label} may run out at {info['runout']:%H:%M}",
+                              f"{early} before it resets, at the last {info['recent']}'s pace.", True))
+        for keys, title, body, urgent in fired:
+            self.sent.update(keys)
+            self.send(title, body, urgent)
+        if fired:  # keep only windows that have not reset yet
+            self.sent = {k for k in self.sent if int(k.split("@")[1].split(":")[0]) > now.timestamp()}
+            save_state(alerts=sorted(self.sent))
+
+
+# ---------------------------------------------------------------- one session in detail
+
+
+def rebuilds(recs):
+    """The main-thread requests, after a session's first, that wrote most of their prompt to the cache
+    again: the cache had expired, usually after a pause. Returns their ids."""
+    by_session = defaultdict(list)
+    for r in recs:
+        if not r.sub:
+            by_session[r.session].append(r)
+    out = set()
+    for rs in by_session.values():
+        rs.sort(key=lambda r: r.ts)
+        for r in rs[1:]:
+            if r.sent > 20_000 and r.cw5 + r.cw1h > 0.5 * r.sent:
+                out.add(id(r))
+    return out
+
+
+def series_chart(values, plot_w, rows, look, fmt, dark):
+    """A braille area chart of `values` (two per cell) with a y axis whose labels `fmt` writes."""
+    top = nice_ceiling(max(values, default=0))
+    blues = BLUES[::-1] if dark else BLUES
+    ramp = [blues[min(i, len(blues) - 1)] for i in range(rows)] if look.accent == ACCENT else [look.accent] * rows
+    ticks = {0: top, rows // 2: top * (1 - (rows // 2) / rows)}
+    lines = []
+    for r, row in enumerate(braille([v / top for v in values], plot_w, rows, ramp)):
+        t = Text(f"{fmt(ticks[r]):>6} ┤" if r in ticks else " " * 7 + "│", style=look.muted, no_wrap=True)
+        t.append_text(row)
+        lines.append(t)
+    return lines
+
+
+def session_page(reader, ui, look, now, width, height):
+    project, sid = ui.detail
+    rs = sorted((r for r in reader.recs.values() if r.session == sid), key=lambda r: r.ts)
+    up = (lambda x: x.upper()) if look.caps else (lambda x: x)
+    dash = ui.theme == "dash"
+    inner = width - (4 if dash else 2)
+    s, sub = Sum.of(rs), Sum.of(r for r in rs if r.sub)
+    first, last = rs[0].ts, rs[-1].ts
+    models = Counter(short_model(r.model) for r in rs).most_common()
+    head = Text(" " + reader.title(sid), style="bold", no_wrap=True, overflow="ellipsis")
+    head.append(f"   {project} · {sid[:8]}", style=look.muted)
+    who = grid2(head, Text(" · ".join(f"{m} ×{n}" for m, n in models[:3]) + " ", style=look.muted))
+    line = f" {when(first)} → {when(last)} ({until(last - first)}) · {round(s.n)} requests"
+    line += f" ({round(sub.n)} by subagents, {sub.money()})" if sub.n else ""
+    line += f" · {tok(s.total)} tok · {s.money()}"
+    paid = defaultdict(float)
+    for r in rs:
+        for k, v in (r.parts or {}).items():
+            paid[k] += v
+    paid_line = Text(" " + up("paid for: "), style=look.muted, no_wrap=True, overflow="ellipsis")
+    paid_line.append(up(" · ".join(f"{k} {money(paid[k])}" for k in PAID_FOR if paid[k] > 0)))
+
+    plot_w = max(10, inner - 8)
+    n, slots = len(rs), plot_w * 2
+    cost_vals, ctx_vals, ctx = [], [], 0
+    for b in range(slots):  # each slot shows the costliest request in it, and the context of its last main request
+        lo = b * n // slots
+        seg = rs[lo:max(lo + 1, (b + 1) * n // slots)]
+        cost_vals.append(max(r.usd or 0 for r in seg))
+        mains = [r.sent for r in seg if not r.sub]
+        ctx = mains[-1] if mains else ctx
+        ctx_vals.append(ctx)
+    chart_rows = 4 if height >= 26 else 3
+    charts = [Text(up(" cost of each request ($)"), style=look.muted),
+              *series_chart(cost_vals, plot_w, chart_rows, look, money, ui.dark),
+              Text(up(" context sent with each request (tokens)"), style=look.muted),
+              *series_chart(ctx_vals, plot_w, chart_rows, look, tok, ui.dark)]
+    axis = list("─" * plot_w)
+    labels = [" "] * (plot_w + 12)
+    multi_day = first.date() != last.date()
+    free = 0
+    for k in range(5):
+        x = round(k * (plot_w - 1) / 4)
+        axis[x] = "┴"
+        stamp = rs[min(n - 1, x * 2 * n // slots)].ts
+        label = when(stamp) if multi_day else f"{stamp:%H:%M}"
+        left = min(max(0, x - len(label) // 2), plot_w - len(label))
+        if left >= free:
+            labels[left:left + len(label)] = label
+            free = left + len(label) + 1
+    charts += [Text(" " * 7 + "└" + "".join(axis), style=look.muted, no_wrap=True),
+               Text(" " * 8 + "".join(labels).rstrip(), style=look.muted, no_wrap=True)]
+
+    rebuilt = rebuilds(rs)
+    rebuilt_usd = sum((r.parts or {}).get("cache write", 0) for r in rs if id(r) in rebuilt)
+    # rows left for the table: who, when, paid for, a gap, the charts, a gap, its title, its head and rule,
+    # the rebuild line; the Dashboard drops the who line into its border and adds the border's two
+    k = max(1, height - 9 - len(charts) - (1 if dash else 0))
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, expand=True, pad_edge=True, border_style=look.muted,
+              header_style=look.muted if ui.theme == "hero" else f"bold {look.accent}")
+    for name, opts in [("When", {}), ("Model", {}), ("Sent", {"justify": "right"}), ("Cache wr", {"justify": "right"}),
+                       ("Output", {"justify": "right"}), ("Est. $", {"justify": "right"}),
+                       ("", {"ratio": 1, "overflow": "ellipsis"})]:
+        t.add_column(up(name), no_wrap=True, **opts)
+    for r in sorted(rs, key=lambda r: r.usd or 0, reverse=True)[:k]:
+        note = "cache rebuilt" if id(r) in rebuilt else "subagent" if r.sub else ""
+        t.add_row(when(r.ts, not multi_day), up(short_model(r.model)), tok(r.sent), tok(r.cw5 + r.cw1h), tok(r.out),
+                  money(r.usd or 0), Text(up(note), style=look.warn if id(r) in rebuilt else look.muted))
+    rebuild_line = Text(up(f" cache rebuilt {len(rebuilt)} time{'s' if len(rebuilt) != 1 else ''} after a pause: "
+                           f"{money(rebuilt_usd)} spent writing the context again" if rebuilt else
+                           " no cache rebuilds: the context stayed cached between requests"),
+                        style=look.muted, no_wrap=True, overflow="ellipsis")
+    body = [who, Text(up(line), style=look.muted, no_wrap=True, overflow="ellipsis"), paid_line, "", *charts, "",
+            Text(up(" most expensive requests"), style="bold"), t, rebuild_line]
+    if dash:
+        return [Panel(Group(*body[1:]), title=Text(f" {reader.title(sid)} ", style=f"bold {look.accent}"),
+                      title_align="left", box=box.ROUNDED, border_style=look.accent, height=height)]
+    return body
+
+
+# ---------------------------------------------------------------- where the money goes
+
+
+def spend_page(reader, ui, look, now, width, height):
+    day0, week0 = bounds(now)
+    recs = list(reader.recs.values())
+    ranges = [("Today", [r for r in recs if r.ts >= day0]), ("This week", [r for r in recs if r.ts >= week0]),
+              ("All time", recs)]
+    up = (lambda x: x.upper()) if look.caps else (lambda x: x)
+    rebuilt = rebuilds(recs)
+    dash = ui.theme == "dash"
+
+    def table(first, rows, footer=None):
+        t = Table(box=box.SIMPLE_HEAD, show_edge=False, show_footer=footer is not None, expand=True, pad_edge=True,
+                  border_style=look.muted, footer_style="bold",
+                  header_style=look.muted if ui.theme == "hero" else f"bold {look.accent}")
+        t.add_column(up(first), no_wrap=True, ratio=1, overflow="ellipsis", footer=up("Total") if footer else "")
+        for i, (name, _) in enumerate(ranges):  # each range: the figure, then its share as a bar in a column of its own
+            t.add_column(up(name), no_wrap=True, justify="right", footer=footer[i] if footer else "")
+            t.add_column("", no_wrap=True, width=6)
+        for row in rows:
+            t.add_row(*row)
+        return t
+
+    def cell(usd, total):
+        return [money(usd), bar(usd / total if total else 0, 6, look.accent)]
+
+    totals = [sum(r.usd or 0 for r in rr) for _, rr in ranges]
+    by_model = [defaultdict(float) for _ in ranges]
+    by_kind = [defaultdict(float) for _ in ranges]
+    for i, (_, rr) in enumerate(ranges):
+        for r in rr:
+            by_model[i][short_model(r.model)] += r.usd or 0
+            for k, v in (r.parts or {}).items():
+                by_kind[i][k] += v
+    models = sorted(by_model[2], key=lambda m: by_model[2][m], reverse=True)
+    t1 = table("Model", [[up(m)] + [c for i in range(3) for c in cell(by_model[i][m], totals[i])] for m in models],
+               [money(x) for x in totals])
+    kinds = [k for k in PAID_FOR if by_kind[2][k] > 0]
+    t2 = table("Paid for", [[up(k)] + [c for i in range(3) for c in cell(by_kind[i][k], totals[i])] for k in kinds])
+    rb = []
+    for _, rr in ranges:
+        mine = [r for r in rr if id(r) in rebuilt]
+        rb += [f"{len(mine)} · {money(sum((r.parts or {}).get('cache write', 0) for r in mine))}", ""]
+    t3 = table("Cache rebuilt after a pause", [[up("times · $ to write the context again")] + rb])
+    sections = [("By model", t1), ("By what was paid for", t2), ("Cache rebuilds", t3)]
+    if dash:
+        return [Panel(t, title=Text(f" {name} ", style=f"bold {look.accent}"), title_align="left", box=box.ROUNDED,
+                      border_style=look.accent) for name, t in sections]
+    out = []
+    for name, t in sections:
+        out += [Text((" > " if look.caps else " ") + up(name), style="bold"), t, ""]
+    return out[:-1]
+
+
 # ---------------------------------------------------------------- the screen
 
 
@@ -1049,15 +1367,22 @@ def render(reader, ui, now, width, height):
     look = THEMES[ui.theme]
     if look.frame:  # a double border and one column of padding each side, all of it painted
         width, height = width - 4, height - 2
+    if ui.detail and not any(r.session == ui.detail[1] for r in reader.recs.values()):
+        ui.detail = None
     if ui.page == 0:
         d = gather(reader, now)
-        bg = ui.background
-        d.dark = bg is not None and 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2] < 128  # unknown: light
+        d.dark = ui.dark
         body = OVERVIEWS[ui.theme](d, look, width, height - 2)
         keys = "←/→ page   t theme   ^C quit"
+    elif ui.page == SPEND:
+        body = spend_page(reader, ui, look, now, width, height - 2)
+        keys = "←/→ page   t theme   ^C quit"
+    elif ui.detail:
+        body = session_page(reader, ui, look, now, width, height - 2)
+        keys = "esc / ⌫ back   ←/→ page   t theme   ^C quit"
     else:
         body = project_page(reader, ui, look, now, width, height - 2)
-        keys = "←/→ page   ↑/↓ move   ⏎ open/close   t theme   ^C quit"
+        keys = "←/→ page   ↑/↓ move   ⏎ open   t theme   ^C quit"
     hint = Text(" " + (keys.upper() if look.caps else keys), style=look.muted, no_wrap=True, overflow="ellipsis")
     unpriced = sorted({r.model for r in reader.recs.values() if r.usd is None})
     if unpriced:
@@ -1076,6 +1401,7 @@ KEYS = {
     b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
     b"\x1b[H": "home", b"\x1b[F": "end", b"\x1bOH": "home", b"\x1bOF": "end", b"\x1b[1~": "home", b"\x1b[4~": "end",
     b"\r": "enter", b"\n": "enter", b" ": "enter", b"t": "theme", b"T": "theme",
+    b"\x7f": "back", b"\x08": "back",
 }
 
 
@@ -1089,7 +1415,10 @@ def parse_keys(data):
                 i += len(seq)
                 break
         else:
-            if data[i] == 0x1B and data[i + 1:i + 2] in (b"[", b"]"):  # another escape sequence: skip it whole
+            if data[i] == 0x1B and i + 1 == len(data):  # Esc on its own
+                keys.append("back")
+                i += 1
+            elif data[i] == 0x1B and data[i + 1:i + 2] in (b"[", b"]"):  # another escape sequence: skip it whole
                 j = i + 2
                 while j < len(data) and not 0x40 <= data[j] <= 0x7E and data[j] != 0x07:
                     j += 1
@@ -1140,6 +1469,7 @@ def main():
     ap.add_argument("--page", choices=PAGE_ARGS, default="overview", help="the page to start on")
     ap.add_argument("--theme", choices=THEMES, help="the theme to start with (default: the one last picked with t)")
     ap.add_argument("--every", type=float, default=2.0, help="seconds between reads (default 2)")
+    ap.add_argument("--no-alerts", action="store_true", help="send no desktop notifications about the limits")
     ap.add_argument("--root", type=Path, default=ROOT, help="transcripts folder (default ~/.claude/projects)")
     args = ap.parse_args()
 
@@ -1160,6 +1490,8 @@ def main():
     signal.signal(signal.SIGHUP, closed)
     signal.signal(signal.SIGTERM, closed)
     try:
+        alerts = Alerts(enabled=not args.no_alerts)
+        alerts.check(reader, dt.datetime.now().astimezone())
         with raw_keys() as fd:
             ui.background = terminal_background(fd) if fd is not None else None
             ui.live = True
@@ -1174,6 +1506,7 @@ def main():
                             ui.key(k)
                     if time.monotonic() >= next_read:
                         reader.poll()
+                        alerts.check(reader, dt.datetime.now().astimezone())
                         next_read = time.monotonic() + args.every
                     live.update(screen(), refresh=True)
     except KeyboardInterrupt:
