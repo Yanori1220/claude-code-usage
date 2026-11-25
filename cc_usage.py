@@ -1235,15 +1235,31 @@ def overview_amber(d, look, width, height):
         t.append(f"   {sub.upper()}", style=AMBER_DIM)
         return t
 
-    parts = ["", leader("Today", d.today.money(), f"{tok(d.today.total)} tok · {round(d.today.n)} req")]
+    top = max(s.usd for _, s, _, _ in d.days) or 1
+    week = Text("> WEEK  ", style=AMBER, no_wrap=True)
+    for day, s, fut, today in d.days:
+        week.append(WEEKDAY[day.weekday()].upper() + " ", style=hot if today else AMBER_DIM)
+        week.append("·" if fut else VERT[max(1, round(s.usd / top * 8))], style=AMBER)
+        week.append("   ")
+    # every part is one line. A blank one is ("gap", rank): short of rows, blank lines go before anything is left
+    # out, the lowest rank first (and of a rank, the lowest on the screen): the one above READY, those between
+    # the limits, the one at the top, above the week, above the processes, under the figures
+    gap = lambda rank: ("gap", rank)
+    processes = object()  # where the processes go, standing for one line of them
+    parts = [gap(3), leader("Today", d.today.money(), f"{tok(d.today.total)} tok · {round(d.today.n)} req")]
     parts += [leader(*k) for k in kpis(d)]
-    parts += ["", *amber_limit("CURRENT SESSION", d.slimit, d.sinfo, "5 h", look, width, d.now),
-              "", *amber_limit("WEEKLY LIMIT", d.limit, d.info, "week", look, width, d.now)]
+    parts += [gap(6), *amber_limit("CURRENT SESSION", d.slimit, d.sinfo, "5 h", look, width, d.now),
+              gap(2), *amber_limit("WEEKLY LIMIT", d.limit, d.info, "week", look, width, d.now)]
     for s in d.scoped:  # a per-model weekly limit (Fable)
-        parts += ["", *amber_limit(s.label.upper(), s.info, s.reason, "week", look, width, d.now,
-                                   detail=scoped_detail(s, d) if s.info else None)]
-    parts += ["", Text("> ACTIVE PROCESSES", style=AMBER)]
-    room = max(1, height - len(parts) - 4)  # each part is a line; the week, READY and their gaps follow
+        parts += [gap(2), *amber_limit(s.label.upper(), s.info, s.reason, "week", look, width, d.now,
+                                       detail=scoped_detail(s, d) if s.info else None)]
+    parts += [gap(5), Text("> ACTIVE PROCESSES", style=AMBER), processes,
+              gap(4), week, gap(1), Text("READY. ", style=AMBER) + Text("█", style=f"blink {AMBER}")]
+    gaps = sorted((p[1], -i) for i, p in enumerate(parts) if isinstance(p, tuple))
+    drop = {-i for _, i in gaps[:max(0, len(parts) - height)]}
+    parts = ["" if isinstance(p, tuple) else p for i, p in enumerate(parts) if i not in drop]
+    room = max(1, height - len(parts) + 1)
+    rows = []
     for n, a in enumerate(d.active[:room], 1):
         name = Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else AMBER)
         name.truncate(max(10, width - 66), overflow="ellipsis", pad=True)
@@ -1256,16 +1272,9 @@ def overview_amber(d, look, width, height):
         req.pad_left(12 - len(req.plain))
         t.append_text(req)
         t.append(f"  {a.sum.money():>8}", style=hot)
-        parts.append(t)
-    if not d.active:
-        parts.append(Text("  NONE", style=AMBER_DIM))
-    top = max(s.usd for _, s, _, _ in d.days) or 1
-    week = Text("> WEEK  ", style=AMBER, no_wrap=True)
-    for day, s, fut, today in d.days:
-        week.append(WEEKDAY[day.weekday()].upper() + " ", style=hot if today else AMBER_DIM)
-        week.append("·" if fut else VERT[max(1, round(s.usd / top * 8))], style=AMBER)
-        week.append("   ")
-    parts += ["", week, "", Text("READY. ", style=AMBER) + Text("█", style=f"blink {AMBER}")]
+        rows.append(t)
+    at = next(i for i, p in enumerate(parts) if p is processes)
+    parts[at:at + 1] = rows or [Text("  NONE", style=AMBER_DIM)]
     return parts
 
 
