@@ -2,6 +2,7 @@
 ratelimits.json
 usage.json
 usage.part
+state.part
 state.json
 __pycache__/
 # local only

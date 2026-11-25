@@ -52,6 +52,8 @@ What the numbers rest on:
 
 import argparse
 import datetime as dt
+import functools
+import http.client
 import json
 import math
 import os
@@ -140,6 +142,7 @@ SPEND, HISTORY = 4, 5
 SORTS = ["cost", "recent"]  # the project lists' orders, switched with s
 
 
+@functools.lru_cache(maxsize=256)  # a handful of model names, asked for once per request at every redraw
 def base_model(model):
     """claude-haiku-4-5-20251001 / claude-opus-5-5[1m] -> the PRICES key."""
     return re.sub(r"(\[.*\]|-\d{8})$", "", model)
@@ -192,6 +195,11 @@ def cost_parts(r):
 def cost(r):
     parts = cost_parts(r)
     return None if parts is None else sum(parts.values())
+
+
+def count(x):
+    """A token count as a transcript gives it: a number, else 0."""
+    return x if isinstance(x, (int, float)) else 0
 
 
 def first_typed(d):
@@ -269,7 +277,10 @@ class Reader:
                 session = parts[1] if sub else Path(parts[1]).stem
                 whole = data.rfind(b"\n") + 1  # a line still being written waits for the next poll
                 for line in data[:whole].split(b"\n"):
-                    self._take(line, parts[0], session, sub)
+                    try:
+                        self._take(line, parts[0], session, sub)
+                    except (AttributeError, TypeError, ValueError, KeyError, OverflowError):
+                        pass  # a line in a shape Claude Code has not written before: it is left out, and the rest read
                 done += whole
             self.pos[path] = (st.st_ino, done)
 
@@ -283,9 +294,9 @@ class Reader:
                 d = json.loads(line)
             except ValueError:
                 return
-            if d.get("type") == "ai-title" and d.get("aiTitle"):
+            if d.get("type") == "ai-title" and d.get("aiTitle") and isinstance(d["aiTitle"], str):
                 self.ai_titles[session] = d["aiTitle"]
-            elif d.get("type") == "agent-name" and d.get("agentName"):
+            elif d.get("type") == "agent-name" and d.get("agentName") and isinstance(d["agentName"], str):
                 self.names[session] = d["agentName"]
         elif session not in self.first and b'"type":"user"' in line:
             try:
@@ -317,7 +328,7 @@ class Reader:
         key = (m.get("id"), d.get("requestId"))
         if key == (None, None):
             key = d.get("uuid") or id(d)
-        out = u.get("output_tokens") or 0
+        out = count(u.get("output_tokens"))
         old = self.recs.get(key)
         if old is not None and old.out >= out:
             return
@@ -328,8 +339,8 @@ class Reader:
                 ts = dt.datetime.fromisoformat(d["timestamp"]).astimezone()
             except (KeyError, TypeError, ValueError):
                 ts = dt.datetime.now().astimezone()
-        cw = u.get("cache_creation_input_tokens") or 0
-        cw1h = min((u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0, cw)
+        cw = count(u.get("cache_creation_input_tokens"))
+        cw1h = min(count((u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens")), cw)
         r = Rec(
             ts=ts,
             project=project,
@@ -337,12 +348,12 @@ class Reader:
             sub=sub,
             model=model,
             speed=u.get("speed") or "standard",
-            inp=u.get("input_tokens") or 0,
+            inp=count(u.get("input_tokens")),
             cw5=cw - cw1h,
             cw1h=cw1h,
-            cr=u.get("cache_read_input_tokens") or 0,
+            cr=count(u.get("cache_read_input_tokens")),
             out=out,
-            ws=(u.get("server_tool_use") or {}).get("web_search_requests") or 0,
+            ws=count((u.get("server_tool_use") or {}).get("web_search_requests")),
         )
         r.parts = cost_parts(r)
         r.usd = None if r.parts is None else sum(r.parts.values())
@@ -415,18 +426,21 @@ def ask_usage():
             body = json.load(resp)
     except urllib.error.HTTPError as e:
         return f"the usage request was refused ({e.code})"
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):  # HTTPException: an answer cut off halfway, say
         return "the usage request failed"
     windows = []
-    for kind in ("five_hour", "seven_day"):
-        w = body.get(kind)
-        if isinstance(w, dict) and w.get("utilization") is not None and w.get("resets_at"):
-            windows.append({"kind": kind, "percentUsed": w["utilization"], "resetsAt": w["resets_at"]})
-    for row in body.get("limits") or []:  # the per-model weekly limits: "Current week (Fable)"
-        name = ((row.get("scope") or {}).get("model") or {}).get("display_name") if isinstance(row, dict) else None
-        if name and row.get("kind") == "weekly_scoped" and row.get("percent") is not None and row.get("resets_at"):
-            windows.append({"kind": "seven_day_" + re.sub(r"\W+", "_", name.lower()), "label": name,
-                            "percentUsed": row["percent"], "resetsAt": row["resets_at"]})
+    try:
+        for kind in ("five_hour", "seven_day"):
+            w = body.get(kind)
+            if isinstance(w, dict) and w.get("utilization") is not None and w.get("resets_at"):
+                windows.append({"kind": kind, "percentUsed": w["utilization"], "resetsAt": w["resets_at"]})
+        for row in body.get("limits") or []:  # the per-model weekly limits: "Current week (Fable)"
+            name = ((row.get("scope") or {}).get("model") or {}).get("display_name") if isinstance(row, dict) else None
+            if name and row.get("kind") == "weekly_scoped" and row.get("percent") is not None and row.get("resets_at"):
+                windows.append({"kind": "seven_day_" + re.sub(r"\W+", "_", name.lower()), "label": name,
+                                "percentUsed": row["percent"], "resetsAt": row["resets_at"]})
+    except (AttributeError, TypeError):  # the endpoint is not a public API: its answer can change shape
+        return "the usage answer was not in a shape it knows"
     try:
         part = USAGE.with_suffix(".part")
         part.write_text(json.dumps({"at": round(time.time() * 1000), "rateLimits": windows}) + "\n")
@@ -447,7 +461,10 @@ class UsageAsker(threading.Thread):
     def run(self):
         wait = USAGE_EVERY
         while True:
-            self.why = ask_usage()
+            try:
+                self.why = ask_usage()
+            except Exception as e:  # anything not foreseen: said on screen, and asked again later, never the end of it
+                self.why = f"the usage request failed ({type(e).__name__})"
             wait = min(wait * 2, 1800) if self.why and "(429)" in self.why else USAGE_EVERY
             time.sleep(wait)
 
@@ -510,7 +527,9 @@ def save_state(**changes):
     state.update(changes)
     try:
         STATE.parent.mkdir(parents=True, exist_ok=True)
-        STATE.write_text(json.dumps(state) + "\n")
+        part = STATE.with_suffix(".part")  # written whole first, then put in place: a kill or a full disk halfway
+        part.write_text(json.dumps(state) + "\n")  # through leaves the last state.json as it was, not an empty one
+        part.replace(STATE)
     except OSError:
         pass
 
@@ -601,6 +620,7 @@ def bounds(now):
     return day0, day0 - dt.timedelta(days=day0.weekday())
 
 
+@functools.lru_cache(maxsize=256)
 def short_model(model):
     """claude-opus-5-5 -> Opus 5.5"""
     m = re.fullmatch(r"claude-([a-z]+)-(\d+)(?:-(\d+))?", base_model(model))
@@ -822,9 +842,10 @@ def limit_info(recs, now, kind="seven_day", span=WEEK, model=None):
     pct, reset, read_at = reading
     if reset <= now:
         return f"the last reading ({when(read_at)}) is from a window that has reset"
+    start = reset - span
+    recs = [r for r in recs if r.ts >= start]  # all that follows counts inside the window: what came before is skipped
     if model:
         recs = model_recs(recs, model)
-    start = reset - span
     refill = REFILLS.get(kind)
     if refill and refill.get("reset") != window_ts(reset):
         refill = None
@@ -849,8 +870,8 @@ def limit_info(recs, now, kind="seven_day", span=WEEK, model=None):
     runout = None
     if pct_now >= 100:
         runout = now
-    elif rate:
-        runout = now + dt.timedelta(hours=(100 - pct_now) / rate)
+    elif rate and (100 - pct_now) / rate < (reset - now).total_seconds() / 3600:  # only a run-out before the reset:
+        runout = now + dt.timedelta(hours=(100 - pct_now) / rate)  # at a crawl's pace the date would pass the year 9999
     return {
         "pct": pct,
         "reset": reset,
@@ -902,12 +923,16 @@ def _pace_text(info, look, caps):
 
 
 def active_sessions(recs, now):
+    """The sessions with a response in the last ACTIVE_MIN minutes, newest first: (its last response, id, all its
+    records, older ones too)."""
+    recs = list(recs)
+    cutoff = now - dt.timedelta(minutes=ACTIVE_MIN)
+    live = {r.session for r in recs if r.ts >= cutoff}
     by_session = defaultdict(list)
     for r in recs:
-        by_session[r.session].append(r)
-    active = [(max(r.ts for r in rs), s, rs) for s, rs in by_session.items()]
-    active = [a for a in active if now - a[0] <= dt.timedelta(minutes=ACTIVE_MIN)]
-    return sorted(active, key=lambda a: a[0], reverse=True)
+        if r.session in live:
+            by_session[r.session].append(r)
+    return sorted(((max(r.ts for r in rs), s, rs) for s, rs in by_session.items()), key=lambda a: a[0], reverse=True)
 
 
 def session_info(reader, sid, rs):
@@ -926,27 +951,35 @@ def per_req_text(a, look, caps=False):
 
 
 def gather(reader, now):
-    recs = list(reader.recs.values())
+    every = list(reader.recs.values())
     day0, week0 = bounds(now)
-    week = Sum.of(r for r in recs if r.ts >= week0)
+    # all the Overview counts lies in the last week (each limit's window ends after now), or on the week's dates;
+    # only the active sessions' totals look further back. The rest is counted from this, however long the history
+    recs = [r for r in every if r.ts >= min(now - WEEK, week0 - dt.timedelta(days=1))]
+    this_week = [r for r in recs if r.ts >= week0]
+    week = Sum.of(this_week)
     elapsed = now - week0
+    by_day = defaultdict(Sum)  # each request on its own date, in the UTC offset it was made in: across a change of
+    for r in recs:  # the clocks that is not now's, so the bars look a day further back than the week does
+        if r.ts >= week0 - dt.timedelta(days=1):
+            by_day[r.ts.date()].add(r)
     days = []
     for i in range(7):
         d = week0 + dt.timedelta(days=i)
-        days.append((d, Sum.of(r for r in recs if r.ts.date() == d.date()), d > day0, d == day0))
+        days.append((d, by_day[d.date()], d > day0, d == day0))
     info = limit_info(recs, now)
     sinfo = limit_info(recs, now, "five_hour", FIVE_HOURS)
     scoped = []  # the per-model weekly limits (Fable): each one's reading, and what its model used this week
     for kind, _, model, label in limit_windows()[2:]:
         got = limit_info(recs, now, kind, WEEK, model)
         scoped.append(SimpleNamespace(label=label, model=model, info=got if isinstance(got, dict) else None,
-                                      reason=got, week=Sum.of(r for r in model_recs(recs, model) if r.ts >= week0)))
+                                      reason=got, week=Sum.of(model_recs(this_week, model))))
     return SimpleNamespace(sinfo=sinfo, slimit=sinfo if isinstance(sinfo, dict) else None, scoped=scoped,
         now=now, recs=recs, reader=reader, week=week, days=days, info=info,
-        today=Sum.of(r for r in recs if r.ts >= day0),
+        today=Sum.of(r for r in this_week if r.ts >= day0),
         proj=week.scaled(WEEK / elapsed) if elapsed >= dt.timedelta(hours=1) else None,
         limit=info if isinstance(info, dict) else None,
-        active=[session_info(reader, s, rs) for _, s, rs in active_sessions(recs, now)],
+        active=[session_info(reader, s, rs) for _, s, rs in active_sessions(every, now)],
     )
 
 
@@ -1299,6 +1332,7 @@ class UI:
         self.live = False  # --once draws no picked row
         self.detail = None  # (project, session) open on its own page, from a project list
         self.usage_why = None  # why the last ask for the plan's usage failed, with --usage-api
+        self.error = None  # what went wrong at the last read, if anything; the next read tries again
         self.sort = load_state().get("sort") if load_state().get("sort") in SORTS else "cost"  # the project lists' order
 
     @property
@@ -1886,6 +1920,8 @@ def render(reader, ui, now, width, height):
         hint.append(f"   * no price: {', '.join(unpriced)}", style=look.muted)
     if ui.usage_why:
         hint.append(f"   ! {ui.usage_why.upper() if look.caps else ui.usage_why}", style=look.warn)
+    if ui.error:
+        hint.append(f"   ! could not read: {ui.error}", style=look.warn)
     screen = Layout()
     screen.split_column(Layout(tabs(ui, look, now), size=1), Layout(Group(*body)), Layout(hint, size=1))
     if look.frame:
@@ -2004,7 +2040,11 @@ def main():
         return
 
     def screen():
-        return render(reader, ui, dt.datetime.now().astimezone(), *console.size)
+        try:
+            return render(reader, ui, dt.datetime.now().astimezone(), *console.size)
+        except Exception as e:  # a state not foreseen: said in place of the page; the other pages may still draw
+            return Text(f" this page could not be drawn ({type(e).__name__}: {e}); cc-usage keeps reading\n"
+                        " ←/→ page   t theme   ^C quit", style="bold")
 
     def closed(signum, frame):  # the terminal closed (SIGHUP) or a kill (SIGTERM): leave the way Ctrl-C does
         raise KeyboardInterrupt
@@ -2022,9 +2062,21 @@ def main():
         asker = UsageAsker() if ask else None
         if asker:
             asker.start()
-        note_refills(reader.recs.values(), dt.datetime.now().astimezone())
         alerts = Alerts(enabled=load_state().get("notify") is True)  # off until --alerts
-        alerts.check(reader, dt.datetime.now().astimezone())
+
+        def refresh():
+            """Take what the transcripts and the readings gained. A failure is shown on the hint line and the next
+            read tries again: weeks of running should not end on one file in a shape not foreseen."""
+            try:
+                reader.poll()
+                now = dt.datetime.now().astimezone()
+                note_refills(reader.recs.values(), now)
+                alerts.check(reader, now)
+                ui.error = None
+            except Exception as e:
+                ui.error = f"{type(e).__name__}: {e}"
+
+        refresh()
         with raw_keys() as fd:
             ui.background = terminal_background(fd) if fd is not None else None
             ui.live = True
@@ -2036,12 +2088,13 @@ def main():
                     if woken in ready:
                         os.read(woken, 1024)
                     if fd in ready:
-                        for k in parse_keys(os.read(fd, 1024)):
+                        typed = os.read(fd, 1024)
+                        if not typed:  # the terminal hung up without a SIGHUP: leave, rather than wake at once forever
+                            break
+                        for k in parse_keys(typed):
                             ui.key(k)
                     if time.monotonic() >= next_read:
-                        reader.poll()
-                        note_refills(reader.recs.values(), dt.datetime.now().astimezone())
-                        alerts.check(reader, dt.datetime.now().astimezone())
+                        refresh()
                         ui.usage_why = asker.why if asker else None
                         next_read = time.monotonic() + args.every
                     live.update(screen(), refresh=True)
