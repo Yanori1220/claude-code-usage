@@ -1004,7 +1004,7 @@ def amber_limit(label, info, reason, window, look, width, now, detail=None):
     if detail is None:
         detail = f"resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
     caption = time_caption("  " + detail.upper(), len(prefix) + mark_x(gone, mw), width, gone, window, look, caps=True)
-    return [line, caption, Text("  ") + pace_text(info, look, caps=True)]
+    return [line, caption, Text("  ", no_wrap=True, overflow="ellipsis") + pace_text(info, look, caps=True)]
 
 
 def reset_text(d):
@@ -1243,7 +1243,7 @@ def overview_amber(d, look, width, height):
         parts += ["", *amber_limit(s.label.upper(), s.info, s.reason, "week", look, width, d.now,
                                    detail=scoped_detail(s, d) if s.info else None)]
     parts += ["", Text("> ACTIVE PROCESSES", style=AMBER)]
-    room = max(1, height - 22 - sum(4 if s.info else 2 for s in d.scoped))
+    room = max(1, height - len(parts) - 4)  # each part is a line; the week, READY and their gaps follow
     for n, a in enumerate(d.active[:room], 1):
         name = Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else AMBER)
         name.truncate(max(10, width - 66), overflow="ellipsis", pad=True)

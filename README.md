@@ -9,7 +9,7 @@ on your machine, so nothing is sent anywhere unless you turn on `--usage-api` (s
 
 ![The Dashboard theme](docs/dash.png)
 
-<sub>The Dashboard theme, drawn from made-up sessions.</sub>
+<sub>The Dashboard theme, drawn from made-up sessions, with `--usage-api` on for the Fable limit.</sub>
 
 ## What it shows
 

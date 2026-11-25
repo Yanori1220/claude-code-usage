@@ -47,7 +47,8 @@ SESSIONS = [  # project, title, model, days ago
 
 
 def made_up(root, data, now):
-    """Transcripts for three sessions over the last few hours, and a limits file."""
+    """Transcripts for three sessions over the last few hours, the mod's limits file, and the one --usage-api
+    writes, which has Fable's weekly limit too."""
     random.seed(7)
     prefix = str(Path.home()).replace("/", "-") + "-"
     for project, title, model, days_ago in SESSIONS:
@@ -79,10 +80,16 @@ def made_up(root, data, now):
                 t += dt.timedelta(minutes=random.uniform(2, 25))
         (folder / f"{sid}.jsonl").write_text("\n".join(lines) + "\n")
     data.mkdir(parents=True, exist_ok=True)
-    (data / "ratelimits.json").write_text(json.dumps({"at": int(now.timestamp() * 1000), "rateLimits": [
+    windows = [
         {"kind": "five_hour", "percentUsed": 37, "resetsAt": (now + dt.timedelta(hours=1, minutes=37)).isoformat()},
         {"kind": "seven_day", "percentUsed": 24, "resetsAt": (now + dt.timedelta(days=2, hours=22)).isoformat()},
-    ]}))
+    ]
+    at = int(now.timestamp() * 1000)
+    (data / "ratelimits.json").write_text(json.dumps({"at": at, "rateLimits": windows}))
+    # Fable's own weekly limit resets with the week. 21% of it for today's Fable session keeps its pace calm
+    # (past ~25%, a day like today would put it on course to run out before the week resets)
+    fable = {"kind": "seven_day_fable", "label": "Fable", "percentUsed": 21, "resetsAt": windows[1]["resetsAt"]}
+    (data / "usage.json").write_text(json.dumps({"at": at, "rateLimits": windows + [fable]}))
 
 
 def rgb(color, default):
