@@ -27,8 +27,8 @@ Its own files live in $CC_USAGE_DIR (default ~/cc-usage):
 - usage.json: the same as Anthropic reports it to /usage, with the per-model weekly
   limits (Fable's) the mod never sees; written here with --usage-api, which asks with
   Claude Code's login token every 5 minutes.
-- state.json: the theme and sort it was last closed on, whether --usage-api is on, the
-  alerts already sent, and each limit's last reading and refill.
+- state.json: the theme and sort it was last closed on, whether --alerts and --usage-api
+  are on, the alerts already sent, and each limit's last reading and refill.
 - aliases.json (optional, by hand): {"old/folder": "new-name"}, for a project whose folder
   was renamed or copied, so its sessions are counted once, under one name; a key can be
   the folder's name as Claude Code writes it, too ("old-folder").
@@ -1968,7 +1968,11 @@ def main():
     ap.add_argument("--page", choices=PAGE_ARGS, default="overview", help="the page to start on")
     ap.add_argument("--theme", choices=THEMES, help="the theme to start with (default: the one last picked with t)")
     ap.add_argument("--every", type=float, default=2.0, help="seconds between reads (default 2)")
-    ap.add_argument("--no-alerts", action="store_true", help="send no desktop notifications about the limits")
+    alerts = ap.add_mutually_exclusive_group()
+    alerts.add_argument("--alerts", dest="alerts", action="store_true", default=None,
+                        help="send desktop notifications when a limit passes 80%% or 90%% or is on course to run "
+                             "out, and when a session's context grows large (remembered; off until turned on)")
+    alerts.add_argument("--no-alerts", dest="alerts", action="store_false", help="stop sending them (remembered)")
     ap.add_argument("--root", type=Path, default=ROOT, help="transcripts folder (default ~/.claude/projects)")
     api = ap.add_mutually_exclusive_group()
     api.add_argument("--usage-api", dest="usage_api", action="store_true", default=None,
@@ -1977,6 +1981,8 @@ def main():
     api.add_argument("--no-usage-api", dest="usage_api", action="store_false", help="stop asking (remembered)")
     args = ap.parse_args()
 
+    if args.alerts is not None:
+        save_state(notify=args.alerts)
     if args.usage_api is not None:
         save_state(usage_api=args.usage_api)
         if not args.usage_api:
@@ -2017,7 +2023,7 @@ def main():
         if asker:
             asker.start()
         note_refills(reader.recs.values(), dt.datetime.now().astimezone())
-        alerts = Alerts(enabled=not args.no_alerts)
+        alerts = Alerts(enabled=load_state().get("notify") is True)  # off until --alerts
         alerts.check(reader, dt.datetime.now().astimezone())
         with raw_keys() as fd:
             ui.background = terminal_background(fd) if fd is not None else None

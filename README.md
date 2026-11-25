@@ -21,9 +21,10 @@ on your machine, so nothing is sent anywhere unless you turn on `--usage-api` (s
   faster than time. Each active session shows what one request costs at its context size, with a ⚠
   once the context passes 400k tokens. The Dashboard theme adds a chart of what you spent over the
   last 6 hours.
-- **Alerts**: a desktop notification when a limit passes 80% and 90%, when it is on course to run
-  out before it resets, and when a session's context passes 400k and 700k tokens. Each one once, and
-  a limit's again after it is refilled early (a `/limit-reset`, a reset voucher).
+- **Alerts**, off until you turn them on with `--alerts`: a desktop notification when a limit passes
+  80% and 90%, when it is on course to run out before it resets, and when a session's context passes
+  400k and 700k tokens. Each one once, and a limit's again after it is refilled early (a
+  `/limit-reset`, a reset voucher).
 - **Today / Week / All time**: every project, by the folder you started Claude Code in (`work/app`),
   sorted by cost. Open a project to see each session by its title, with its model, first and last use,
   requests, tokens and cost.
@@ -129,7 +130,8 @@ python3 cc_usage.py --page week      # start on another page: overview, today, w
 python3 cc_usage.py --theme amber    # start with another theme: hero, dash, amber
 python3 cc_usage.py --once           # print one screen and exit
 python3 cc_usage.py --every 5        # read the transcripts every 5 s instead of 2
-python3 cc_usage.py --no-alerts      # no desktop notifications
+python3 cc_usage.py --alerts         # send desktop notifications about the limits and context (remembered)
+python3 cc_usage.py --no-alerts      # stop them again (remembered)
 python3 cc_usage.py --usage-api      # also read the plan's usage from Anthropic: the Fable limit (remembered)
 python3 cc_usage.py --no-usage-api   # stop that (remembered)
 ```
@@ -149,7 +151,7 @@ set the variable for both `cc_usage.py` (your shell) and the mod (the `env` bloc
 |---|---|
 | `ratelimits.json` | the latest limit readings, written by the mod |
 | `usage.json` | the latest readings from Anthropic, Fable's included, with `--usage-api` |
-| `state.json` | the theme and sort it was last closed on, whether `--usage-api` is on, the alerts already sent (so a restart does not repeat them), and each limit's last reading and refill |
+| `state.json` | the theme and sort it was last closed on, whether `--alerts` and `--usage-api` are on, the alerts already sent (so a restart does not repeat them), and each limit's last reading and refill |
 | `aliases.json` | optional, written by hand: `{"old/folder": "new-name"}`, for a project whose folder you renamed or copied, so its sessions are counted once, under one name. A key can also be a folder's name as Claude Code writes it, with `-` for `/` (`old-folder`) |
 
 ## How the numbers are worked out
