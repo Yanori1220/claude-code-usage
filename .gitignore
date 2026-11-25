@@ -1,5 +1,7 @@
 # written while it runs
 ratelimits.json
+usage.json
+usage.part
 state.json
 __pycache__/
 # local only

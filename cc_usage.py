@@ -22,11 +22,16 @@ what a file gained is read.
 
 Its own files live in $CC_USAGE_DIR (default ~/cc-usage):
 - ratelimits.json: the account's limit windows, "% used" and reset time, which the
-  transcripts do not hold. The mod in limits-mod/ writes it; without it the Overview
-  leaves the limits out.
-- state.json: the theme it was last closed on.
-- aliases.json (optional, by hand): {"old-project-folder": "new-name"}, for a project
-  whose folder was renamed or copied, so its sessions are counted once, under one name.
+  transcripts do not hold. The mod in limits-mod/ writes it; without it (or usage.json)
+  the Overview leaves the limits out.
+- usage.json: the same as Anthropic reports it to /usage, with the per-model weekly
+  limits (Fable's) the mod never sees; written here with --usage-api, which asks with
+  Claude Code's login token every 5 minutes.
+- state.json: the theme and sort it was last closed on, whether --usage-api is on, the
+  alerts already sent, and each limit's last reading and refill.
+- aliases.json (optional, by hand): {"old/folder": "new-name"}, for a project whose folder
+  was renamed or copied, so its sessions are counted once, under one name; a key can be
+  the folder's name as Claude Code writes it, too ("old-folder").
 
 What the numbers rest on:
 - One response is written as several lines, each carrying its usage again, and the
@@ -38,7 +43,11 @@ What the numbers rest on:
 - Costs are the public API list prices below: an estimate, not a bill.
 - A limit's allowance is estimated as (used in the limit's window) / (% used). A limit
   is not a plain token count (models weigh differently), and use outside Claude Code
-  (claude.ai) counts toward it too, so the estimate runs low then.
+  (claude.ai) counts toward it too, so the estimate runs low then. A limit refilled
+  early (/limit-reset, a reset voucher) keeps its reset time while its % falls; from
+  then on the window counts from the refill.
+- A project is the folder its sessions started in (their lines' `cwd`), as a path under
+  the home folder; a week runs Monday to Sunday.
 """
 
 import argparse
@@ -54,7 +63,10 @@ import subprocess
 import sys
 import termios
 import textwrap
+import threading
 import time
+import urllib.error
+import urllib.request
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -75,7 +87,10 @@ from rich.text import Text
 ROOT = Path.home() / ".claude" / "projects"
 DATA = Path(os.environ.get("CC_USAGE_DIR") or Path.home() / "cc-usage")  # the mod reads the same variable
 LIMITS = DATA / "ratelimits.json"  # written by the cc-usage-limits mod
-STATE = DATA / "state.json"  # the theme it was last closed on, and the alerts already sent
+USAGE = DATA / "usage.json"  # the plan's usage as /usage reads it, written here when --usage-api is on
+STATE = DATA / "state.json"  # the theme it was last closed on, the alerts already sent, the limits' refills
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage?skip_spend=1"  # what Claude Code's /usage asks
+USAGE_EVERY = 300  # seconds between asks
 ACTIVE_MIN = 30  # a session is shown as active if it got a response in the last N minutes
 CONTEXT_WARN = (400_000, 700_000)  # context sizes (tokens) a session is warned about, then alerted again
 
@@ -203,21 +218,38 @@ class Reader:
         self.names = {}  # session id -> agent-name
         self.ai_titles = {}  # session id -> ai-title
         self.first = {}  # session id -> the first line typed in it
+        self.where = {}  # session id -> the project its records go under, from the folder it started in
+        self.waiting = defaultdict(list)  # session id -> its records made before that folder was known
 
     def title(self, session):
         return self.names.get(session) or self.ai_titles.get(session) or self.first.get(session) or session[:8]
 
-    def project_of(self, folder):
-        name = folder.removeprefix(self.home)
-        if name.startswith("-tmp-"):  # a session started in a temporary folder
+    def project_of(self, folder, cwd=None):
+        """The name a session's records go under: the folder it started in (its first line's `cwd`), under the
+        home folder, as a path ("work/app"). Without one, the project folder's name, in which Claude Code wrote
+        every "/" and "_" as "-". aliases.json renames either: a key is a path or such a folder name."""
+        if folder.startswith("-tmp-") or (cwd or "").startswith("/tmp/"):  # a session started in a temporary folder
             return "tmp"
+        if cwd:
+            home = str(Path.home())
+            name = "~" if cwd == home else cwd[len(home) + 1:] if cwd.startswith(home + "/") else cwd
+            parts = name.split("/")
+            for i in range(len(parts), 0, -1):  # the most leading folders an alias names
+                head = "/".join(parts[:i])
+                new = ALIASES.get(head) or ALIASES.get(re.sub(r"[^A-Za-z0-9]", "-", head))
+                if new:
+                    return "/".join([new, *parts[i:]])
+            return name
+        name = folder.removeprefix(self.home)
         for old, new in ALIASES.items():
             if name == old or name.startswith(old + "-"):
                 return new + name[len(old):]
         return name
 
     def poll(self):
-        for path in sorted(self.root.rglob("*.jsonl")):
+        # as strings, a session's own file (<id>.jsonl) comes before its subagents' (<id>/subagents/), so the
+        # folder the session started in is known before its subagents' records are made
+        for path in sorted(self.root.rglob("*.jsonl"), key=str):
             try:
                 st = path.stat()
             except OSError:
@@ -233,18 +265,17 @@ class Reader:
                 except OSError:
                     continue
                 parts = path.relative_to(self.root).parts
-                project = self.project_of(parts[0])
                 sub = len(parts) > 2
                 session = parts[1] if sub else Path(parts[1]).stem
                 whole = data.rfind(b"\n") + 1  # a line still being written waits for the next poll
                 for line in data[:whole].split(b"\n"):
-                    self._take(line, project, session, sub)
+                    self._take(line, parts[0], session, sub)
                 done += whole
             self.pos[path] = (st.st_ino, done)
 
-    def _take(self, line, project, session, sub):
+    def _take(self, line, folder, session, sub):
         if b'"usage"' in line:
-            self._usage(line, project, session, sub)
+            self._usage(line, folder, session, sub)
         elif sub:
             return
         elif b'"ai-title"' in line or b'"agent-name"' in line:
@@ -265,13 +296,19 @@ class Reader:
             if text:
                 self.first[session] = text
 
-    def _usage(self, line, project, session, sub):
+    def _usage(self, line, folder, session, sub):
         try:
             d = json.loads(line)
         except ValueError:
             return
         if not isinstance(d, dict) or d.get("type") != "assistant":
             return
+        # the folder a session started in, from its main thread (a subagent may work in a worktree of its own)
+        if session not in self.where and not sub and isinstance(d.get("cwd"), str) and d["cwd"]:
+            self.where[session] = self.project_of(folder, d["cwd"])
+            for r in self.waiting.pop(session, []):  # records made before it was known go under it too
+                r.project = self.where[session]
+        project = self.where.get(session) or self.project_of(folder)
         m = d.get("message") or {}
         u = m.get("usage") or {}
         model = m.get("model") or "?"
@@ -310,23 +347,109 @@ class Reader:
         r.parts = cost_parts(r)
         r.usd = None if r.parts is None else sum(r.parts.values())
         self.recs[key] = r
+        if session not in self.where:
+            self.waiting[session].append(r)
 
 
-def read_limits(path, kind="seven_day"):
-    """One window from the mod's file (seven_day = the week, five_hour = /usage's "Current session"):
-    (% used, resets at, read at), or a reason."""
+def iso_minute(text):
+    """An ISO 8601 time ("Z" too) to the nearest minute: the usage endpoint's carry stray milliseconds, and
+    "resets 10:59" for 11:00 would read wrong."""
+    t = dt.datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone()
+    return (t + dt.timedelta(seconds=30)).replace(second=0, microsecond=0)
+
+
+def read_limits(kind="seven_day", paths=None):
+    """One window's newest reading, from the mod's file or the usage endpoint's (seven_day = the week, five_hour =
+    /usage's "Current session", seven_day_fable = "Current week (Fable)"): (% used, resets at, read at), or a reason."""
+    best, reason = None, "no reading yet"
+    for path in paths or (LIMITS, USAGE):
+        try:
+            reading = json.loads(path.read_text())
+            window = next(w for w in reading["rateLimits"] if w.get("kind") == kind)
+            got = (float(window["percentUsed"]), iso_minute(window["resetsAt"]),
+                   dt.datetime.fromtimestamp(reading["at"] / 1000).astimezone())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, StopIteration):
+            reason = f"no {kind} reading"
+            continue
+        if best is None or got[2] > best[2]:
+            best = got
+    return best or reason
+
+
+def scoped_limits():
+    """The plan's per-model weekly limits, as the usage endpoint last reported them: [(kind, model name)],
+    e.g. [("seven_day_fable", "Fable")]."""
     try:
-        reading = json.loads(path.read_text())
-        window = next(w for w in reading["rateLimits"] if w.get("kind") == kind)
-        return (
-            float(window["percentUsed"]),
-            dt.datetime.fromisoformat(window["resetsAt"]).astimezone(),
-            dt.datetime.fromtimestamp(reading["at"] / 1000).astimezone(),
-        )
-    except FileNotFoundError:
-        return "no reading yet"
-    except (OSError, ValueError, KeyError, TypeError, StopIteration):
-        return f"no {kind} reading"
+        return [(w["kind"], w["label"]) for w in json.loads(USAGE.read_text())["rateLimits"] if w.get("label")]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def login_token():
+    """Claude Code's login token, from its credentials file: (token, None), or (None, why not)."""
+    folder = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    try:
+        login = json.loads((folder / ".credentials.json").read_text())["claudeAiOauth"]
+        token, expires = login["accessToken"], login.get("expiresAt")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, "no Claude Code login found"
+    if isinstance(expires, (int, float)) and expires / 1000 < time.time() + 60:
+        return None, "Claude Code's login has expired; it renews it when it next runs"
+    return token, None
+
+
+def ask_usage():
+    """Ask Anthropic for the plan's usage, as /usage does, with Claude Code's login token, and write its windows to
+    usage.json. The token goes to api.anthropic.com and nowhere else, and is never renewed here: renewing it
+    would replace the one Claude Code holds. Returns None, or why it could not."""
+    token, why = login_token()
+    if token is None:
+        return why
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json", "User-Agent": "cc-usage"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.load(resp)
+    except urllib.error.HTTPError as e:
+        return f"the usage request was refused ({e.code})"
+    except (OSError, ValueError):
+        return "the usage request failed"
+    windows = []
+    for kind in ("five_hour", "seven_day"):
+        w = body.get(kind)
+        if isinstance(w, dict) and w.get("utilization") is not None and w.get("resets_at"):
+            windows.append({"kind": kind, "percentUsed": w["utilization"], "resetsAt": w["resets_at"]})
+    for row in body.get("limits") or []:  # the per-model weekly limits: "Current week (Fable)"
+        name = ((row.get("scope") or {}).get("model") or {}).get("display_name") if isinstance(row, dict) else None
+        if name and row.get("kind") == "weekly_scoped" and row.get("percent") is not None and row.get("resets_at"):
+            windows.append({"kind": "seven_day_" + re.sub(r"\W+", "_", name.lower()), "label": name,
+                            "percentUsed": row["percent"], "resetsAt": row["resets_at"]})
+    try:
+        part = USAGE.with_suffix(".part")
+        part.write_text(json.dumps({"at": round(time.time() * 1000), "rateLimits": windows}) + "\n")
+        part.replace(USAGE)
+    except OSError:
+        return f"could not write {USAGE}"
+    return None
+
+
+class UsageAsker(threading.Thread):
+    """Asks for the plan's usage every USAGE_EVERY seconds, in the background, so a slow answer never holds the
+    screen up; after a refusal for asking too often (429) it waits twice as long each time, up to half an hour."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.why = None  # why the last ask failed, or None
+
+    def run(self):
+        wait = USAGE_EVERY
+        while True:
+            self.why = ask_usage()
+            wait = min(wait * 2, 1800) if self.why and "(429)" in self.why else USAGE_EVERY
+            time.sleep(wait)
 
 
 
@@ -618,31 +741,110 @@ def context_frac(rs):
 # ---------------------------------------------------------------- what every Overview shows
 
 
-def limit_info(recs, now, kind="seven_day", span=WEEK):
-    reading = read_limits(LIMITS, kind)
+REFILLS = {}  # kind -> its window's last refill (a /limit-reset, a reset voucher), as note_refills keeps it
+
+
+def limit_windows():
+    """Every limit a reading can come for: (kind, span, the model a per-model limit counts, label)."""
+    return [("five_hour", FIVE_HOURS, None, "5-hour limit"), ("seven_day", WEEK, None, "Weekly limit")] + [
+        (kind, WEEK, name, f"{name} limit") for kind, name in scoped_limits()]
+
+
+def model_recs(recs, name):
+    """The requests a per-model limit counts: those of the model it names ("Fable": Fable 5, Fable 5.2, ...)."""
+    name = name.lower()
+    return [r for r in recs if short_model(r.model).lower().startswith(name)]
+
+
+def window_ts(reset):
+    """A limit window's key: when it resets, in seconds."""
+    return int(reset.timestamp())
+
+
+def estimate(recs, start, pct, read_at, refill):
+    """A window's allowance (the Sum of requests it takes to use all of it) and how many points of the window that
+    rests on: what was used from the window's start, or its last refill, up to the reading, over the points the %
+    moved meanwhile. After a refill the estimate from before it holds until a new one rests on 10 points."""
+    base_at, base_pct = start, 0.0
+    if refill:
+        base_at, base_pct = dt.datetime.fromtimestamp(refill["at"]).astimezone(), refill["pct"]
+    moved = pct - base_pct
+    kept = (Sum(*refill["allowance"]), refill["basis"]) if refill and refill.get("allowance") else None
+    if kept and moved < 10:
+        return kept
+    used = Sum.of(r for r in recs if base_at <= r.ts <= read_at)
+    if moved >= 1 and used.usd > 0:  # nothing recorded (all of it used on claude.ai, say): no estimate, not $0
+        return used.scaled(100 / moved), moved
+    return kept or (None, moved)
+
+
+def note_refills(recs, now):
+    """Notice a limit refilled before it resets (a /limit-reset, a reset voucher): its % falls while its reset stays
+    put. The % then counts only what came after the refill, so the estimates count from there too. A reading is
+    compared only with the last one from the same file (the mod's, or the endpoint's, which may lag the other by
+    a point or two), and a fall both see is one refill. Each window's last readings and refill are kept in
+    state.json, so a refill made while this was not running is noticed at the next start."""
+    recs = list(recs)
+    seen = load_state().get("limits")
+    seen = seen if isinstance(seen, dict) else {}
+    kept = dict(seen)
+    for kind, span, model, _ in limit_windows():
+        for path in (LIMITS, USAGE):
+            reading = read_limits(kind, (path,))
+            if isinstance(reading, str) or reading[1] <= now:
+                continue
+            pct, reset, read_at = reading
+            entry = kept.get(kind) if isinstance(kept.get(kind), dict) else {}
+            if entry.get("reset") != window_ts(reset):  # a new window
+                entry = {"reset": window_ts(reset), "seen": {}}
+            last = (entry.get("seen") or {}).get(path.name)  # [% used, read at] from this file
+            refill = entry.get("refill")
+            # a fall of 3 points or more, not already taken for a refill since that last reading
+            if last and pct <= last[0] - 3 and read_at.timestamp() > last[1] and not (refill and refill["at"] > last[1]):
+                allowance, basis = estimate(model_recs(recs, model) if model else recs, reset - span, last[0],
+                                            dt.datetime.fromtimestamp(last[1]).astimezone(), refill)
+                refill = {"reset": window_ts(reset), "at": read_at.timestamp(), "pct": pct, "basis": basis,
+                          "allowance": [getattr(allowance, f.name) for f in fields(Sum)[:6]] if allowance else None}
+            kept[kind] = {**entry, "seen": {**(entry.get("seen") or {}), path.name: [pct, read_at.timestamp()]},
+                          **({"refill": refill} if refill else {})}
+    if kept != seen:
+        save_state(limits=kept)
+    REFILLS.clear()
+    REFILLS.update({k: v["refill"] for k, v in kept.items() if isinstance(v, dict) and v.get("refill")})
+
+
+def limit_info(recs, now, kind="seven_day", span=WEEK, model=None):
+    """A limit window's reading and what the requests made in it say: its allowance, what is left, the pace, and
+    when it runs out at that pace. `model` narrows the requests to that model's, for a per-model limit."""
+    reading = read_limits(kind)
     if isinstance(reading, str):
         return reading
     pct, reset, read_at = reading
     if reset <= now:
         return f"the last reading ({when(read_at)}) is from a window that has reset"
+    if model:
+        recs = model_recs(recs, model)
     start = reset - span
-    used = Sum.of(r for r in recs if r.ts >= start)
-    allowance = Sum.of(r for r in recs if start <= r.ts <= read_at).scaled(100 / pct) if pct >= 1 else None
+    refill = REFILLS.get(kind)
+    if refill and refill.get("reset") != window_ts(reset):
+        refill = None
+    since = dt.datetime.fromtimestamp(refill["at"]).astimezone() if refill else start  # what the % counts from
+    allowance, basis = estimate(recs, start, pct, read_at, refill)
     # the pace: % per hour over the recent stretch (the last 30 min of a 5-hour window, the last
-    # 24 h of the week), from $ spent against the allowance; without an allowance, the window's average
+    # 24 h of the week), from $ spent against the allowance; without an allowance, the average since `since`
     recent = dt.timedelta(minutes=30) if span == FIVE_HOURS else dt.timedelta(hours=24)
-    since = max(start, now - recent)
-    hours = max((now - since).total_seconds() / 3600, 1 / 60)
+    stretch = max(start, now - recent)
+    hours = max((now - stretch).total_seconds() / 3600, 1 / 60)
     if allowance and allowance.usd > 0:
-        rate = sum(r.usd or 0 for r in recs if r.ts >= since) / allowance.usd * 100 / hours
-        pct_now = max(pct, used.usd / allowance.usd * 100)
+        rate = sum(r.usd or 0 for r in recs if r.ts >= stretch) / allowance.usd * 100 / hours
+        pct_now = pct + sum(r.usd or 0 for r in recs if r.ts > read_at) / allowance.usd * 100  # and since the reading
     else:
-        rate = pct / max((now - start).total_seconds() / 3600, 1 / 60)
+        rate = (pct - (refill["pct"] if refill else 0)) / max((now - since).total_seconds() / 3600, 1 / 60)
         pct_now = pct
     # too early to tell: a window just begun, or so little used that a 1% step in the reading moves the
     # allowance by a tenth or more, would predict wildly (a new 5-hour window "running out" in minutes)
     early = dt.timedelta(minutes=15) if span == FIVE_HOURS else dt.timedelta(hours=6)
-    if pct < 10 or now - start < early:
+    if basis < 10 or now - start < early:
         rate = None
     runout = None
     if pct_now >= 100:
@@ -653,9 +855,11 @@ def limit_info(recs, now, kind="seven_day", span=WEEK):
         "pct": pct,
         "reset": reset,
         "read_at": read_at,
+        "since": since,
+        "refilled": since if refill else None,
         "gone": (now - start) / span,
         "allowance": allowance,
-        "left": allowance.minus(used) if allowance else None,
+        "left": allowance.scaled(max(0.0, 1 - pct_now / 100)) if allowance else None,
         "rate": rate,
         "recent": "30 min" if span == FIVE_HOURS else "24 h",
         "runout": runout if runout and runout < reset else None,
@@ -732,7 +936,12 @@ def gather(reader, now):
         days.append((d, Sum.of(r for r in recs if r.ts.date() == d.date()), d > day0, d == day0))
     info = limit_info(recs, now)
     sinfo = limit_info(recs, now, "five_hour", FIVE_HOURS)
-    return SimpleNamespace(sinfo=sinfo, slimit=sinfo if isinstance(sinfo, dict) else None, 
+    scoped = []  # the per-model weekly limits (Fable): each one's reading, and what its model used this week
+    for kind, _, model, label in limit_windows()[2:]:
+        got = limit_info(recs, now, kind, WEEK, model)
+        scoped.append(SimpleNamespace(label=label, model=model, info=got if isinstance(got, dict) else None,
+                                      reason=got, week=Sum.of(r for r in model_recs(recs, model) if r.ts >= week0)))
+    return SimpleNamespace(sinfo=sinfo, slimit=sinfo if isinstance(sinfo, dict) else None, scoped=scoped,
         now=now, recs=recs, reader=reader, week=week, days=days, info=info,
         today=Sum.of(r for r in recs if r.ts >= day0),
         proj=week.scaled(WEEK / elapsed) if elapsed >= dt.timedelta(hours=1) else None,
@@ -751,21 +960,38 @@ def kpis(d):
     ]
 
 
-def limit_block(info, reason, label, look, width, now, window, wrap=lambda x: x):
-    """Three lines for one limit window: its % used, a meter with ┃ at the share of the window gone, when it resets."""
+def scoped_detail(s, d):
+    """The line under a per-model limit's meter: what its model used this week (from Monday) and what is left;
+    when it resets too, if not with the weekly limit."""
+    reset, left = s.info["reset"], s.info["left"]
+    parts = [] if d.limit and window_ts(d.limit["reset"]) == window_ts(reset) else [
+        f"resets {WEEKDAY[reset.weekday()]} {reset:%H:%M} · in {until(reset - d.now)}"]
+    parts.append(f"{s.week.money()} this week")
+    if left:
+        parts.append(f"~{left.money()} left")
+    read_at = s.info["read_at"]
+    if d.now - read_at > dt.timedelta(minutes=15):  # asked for every 5 minutes: older means the asks are failing
+        parts.append(f"as of {when(read_at, read_at.date() == d.now.date())}")
+    return " · ".join(parts)
+
+
+def limit_block(info, reason, label, look, width, now, window, wrap=lambda x: x, detail=None):
+    """Four lines for one limit window: its % used, a meter with ┃ at the share of the window gone, when it resets
+    (or `detail`), and the pace."""
     if not info:
         return [wrap(Text(f"{label}: {reason}", style=look.muted))]
     pct, gone, reset, left = info["pct"], info["gone"], info["reset"], info["left"]
     at = f"{WEEKDAY[reset.weekday()]} {reset:%H:%M}" if window == "week" else f"{reset:%H:%M}"
-    detail = f"resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
+    if detail is None:
+        detail = f"resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
     return [wrap(grid2(Text(label, style=look.muted), Text(f"{pct:g}% used", style="bold"), width=width)),
             wrap(meter(pct / 100, width, look, gone)),
             wrap(time_caption(detail, mark_x(gone, width), width, gone, window, look)),
             wrap(pace_text(info, look, width=width))]
 
 
-def amber_limit(label, info, reason, window, look, width, now):
-    """The same in the Amber theme's words: one meter line, one detail line."""
+def amber_limit(label, info, reason, window, look, width, now, detail=None):
+    """The same in the Amber theme's words: one meter line, one detail line, the pace."""
     if not info:
         return [Text(f"> {label:<15} {str(reason).upper()}", style=AMBER_DIM, no_wrap=True, overflow="ellipsis")]
     pct, gone, reset, left = info["pct"], info["gone"], info["reset"], info["left"]
@@ -775,8 +1001,9 @@ def amber_limit(label, info, reason, window, look, width, now):
     line.append_text(meter(pct / 100, mw, look, gone))
     line.append(f"] {pct:5.1f}%", style=f"bold {AMBER}")
     at = f"{WEEKDAY[reset.weekday()]} {reset:%H:%M}" if window == "week" else f"{reset:%H:%M}"
-    detail = f"  resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
-    caption = time_caption(detail.upper(), len(prefix) + mark_x(gone, mw), width, gone, window, look, caps=True)
+    if detail is None:
+        detail = f"resets {at} · in {until(reset - now)}" + (f" · ~{left.money()} left" if left else "")
+    caption = time_caption("  " + detail.upper(), len(prefix) + mark_x(gone, mw), width, gone, window, look, caps=True)
     return [line, caption, Text("  ") + pace_text(info, look, caps=True)]
 
 
@@ -856,12 +1083,16 @@ def activity(recs, now, n, hours):
 def overview_hero(d, look, width, height):
     c = Align.center
     mw = max(30, min(84, width - 16))
-    gap = [""] * (2 if height >= 28 else 1)  # the space between blocks shrinks before anything is left out
+    # the space between blocks shrinks before anything is left out: a per-model limit's block takes 7 rows more
+    gap = [""] * (2 if height >= 28 + 7 * len(d.scoped) else 1)
     parts = [c(Text("T O D A Y", style=look.muted)), "", c(big(d.today.money(), f"bold {look.accent}")), "",
              c(Text(f"{tok(d.today.total)} tokens   ·   {round(d.today.n)} requests   ·   {len(d.active)} active now",
                     style=look.muted)), *gap]
     parts += limit_block(d.slimit, d.sinfo, "current session · 5-hour limit", look, mw, d.now, "5 h", c)
     parts += [*gap, *limit_block(d.limit, d.info, "weekly limit", look, mw, d.now, "week", c)]
+    for s in d.scoped:  # a per-model weekly limit (Fable)
+        parts += [*gap, *limit_block(s.info, s.reason, s.label, look, mw, d.now, "week", c,
+                                     detail=scoped_detail(s, d) if s.info else None)]
     used = len(parts) + 2  # the figure is three lines tall
     if height - used >= len(gap) + 3:
         stats = Table.grid(padding=(0, 4))
@@ -890,15 +1121,56 @@ def overview_hero(d, look, width, height):
     return [Align.center(Group(*parts), vertical="middle", height=height)]
 
 
+def budget_lines(d, look, st, sw, rows, scoped):
+    """The Dashboard's budget panel in `rows` lines of `sw`: the figures (`st`), then each weekly limit, the week's
+    and the per-model ones (`scoped`), as its % and a meter; under the week's, when it resets, and under a model's,
+    what it used this week and has left; then each one's pace. Short of rows, the week's pace stays longest, then
+    a model's line and pace, then the caption under the week's ┃. Rows to spare wrap the paces rather than cut
+    them, then part the blocks."""
+    muted = lambda s: Text(s, style=look.muted, no_wrap=True, overflow="ellipsis")
+    shown = [("weekly limit", d.limit, muted(reset_text(d)), True)] if d.limit else []  # (.., the line under, kept)
+    shown += [(s.label, s.info, muted(scoped_detail(s, d)), False) for s in scoped]
+    free = rows - 4 - sum(3 if kept else 2 for *_, kept in shown) - (0 if d.limit else 2)
+    wanted = [w for i, (*_, kept) in enumerate(shown) for w in ([] if kept else [("under", i)]) + [("pace", i)]]
+    take = set(wanted[:max(0, free)] + ([("caption", 0)] if d.limit and free > len(wanted) else []))
+    free -= len(take)
+    gaps = [0] * len(shown)  # blank lines before each block: first one between blocks, then (after the paces' wraps)
+    for i in range(1, len(shown)):  # up to two under the figures
+        if free > 0:
+            gaps[i], free = 1, free - 1
+    paces = {}
+    for i, (_, info, _, _) in enumerate(shown):
+        if ("pace", i) in take:
+            paces[i] = pace_lines(info, look, sw, 1 + max(0, free))
+            free -= len(paces[i]) - 1
+    if shown:
+        gaps[0] = min(2, max(0, free))
+    out = [st] if d.limit else [st, "", Text(f"weekly limit: {d.info}", style=look.muted)]
+    for i, (label, info, under, kept) in enumerate(shown):
+        gone = info["gone"]
+        out += [""] * gaps[i] + [grid2(Text(label, style=look.muted), Text(f"{info['pct']:g}%", style="bold")),
+                                 meter(info["pct"] / 100, sw, look, gone)]
+        if ("caption", i) in take:
+            out.append(time_caption("", mark_x(gone, sw), sw, gone, "week", look))
+        if kept or ("under", i) in take:
+            out.append(under)
+        out += paces.get(i, [])
+    return out
+
+
 def overview_dash(d, look, width, height):
     side = max(30, width // 3)  # the right column: a third of the window, so it widens and narrows with it
     sw = side - 2  # inside the right column's panels, less their border and padding
     # the rows: the bottom one needs the current session's 6 and a line for each active session, and 11 at
-    # least for the week's bars; the top one, the activity chart and the budget, 11. Rows neither needs are
-    # shared out, half each, so both follow the window's height.
+    # least for the week's bars; the top one, the activity chart and the budget, 11. Rows neither needs go
+    # first to the budget, until all its lines show, then half each, so both follow the window's height.
     cur_h = 6
     need = max(11, cur_h + 2 + max(1, len(d.active)))
-    top = 11 + max(0, height - 11 - need) // 2
+    scoped = [s for s in d.scoped if s.info]
+    full = 2 + 4 + (5 if d.limit else 2) + 4 * len(scoped)  # the budget panel with every line it has
+    spare = max(0, height - 11 - need)
+    first = min(spare, max(0, full - 11))
+    top = 11 + first + (spare - first) // 2
     gh = top - 5
     gw = max(18, width - side - 6)
     lines, bucket, peak = activity_chart(d.recs, d.now, gw, gh + 3, look, dark=d.dark)
@@ -916,20 +1188,7 @@ def overview_dash(d, look, width, height):
     st.add_row("today", d.today.money(), f"{tok(d.today.total)} tok")
     for label, value, sub in kpis(d):
         st.add_row(label.lower(), value, sub.split(" / ")[0])
-    budget = [st]
-    if d.limit:
-        pct = d.limit["pct"]
-        gone = d.limit["gone"]
-        # 8 lines and the pace. Rows to spare go first to the pace, which wraps rather than being cut, then
-        # up to two part the figures from the limit; any more are left below
-        block = [grid2(Text("weekly limit", style=look.muted), Text(f"{pct:g}%", style="bold")),
-                 meter(pct / 100, sw, look, gone),
-                 time_caption("", mark_x(gone, sw), sw, gone, "week", look),
-                 Text(reset_text(d), style=look.muted, no_wrap=True, overflow="ellipsis"),
-                 *pace_lines(d.limit, look, sw, top - 10)]
-        budget += [""] * min(2, top - 6 - len(block)) + block
-    else:
-        budget += ["", Text(f"weekly limit: {d.info}", style=look.muted)]
+    budget = budget_lines(d, look, st, sw, top - 2, scoped)
 
     bottom = max(6, height - top)
     ses = Table.grid(expand=True, padding=(0, 1))
@@ -980,8 +1239,11 @@ def overview_amber(d, look, width, height):
     parts += [leader(*k) for k in kpis(d)]
     parts += ["", *amber_limit("CURRENT SESSION", d.slimit, d.sinfo, "5 h", look, width, d.now),
               "", *amber_limit("WEEKLY LIMIT", d.limit, d.info, "week", look, width, d.now)]
+    for s in d.scoped:  # a per-model weekly limit (Fable)
+        parts += ["", *amber_limit(s.label.upper(), s.info, s.reason, "week", look, width, d.now,
+                                   detail=scoped_detail(s, d) if s.info else None)]
     parts += ["", Text("> ACTIVE PROCESSES", style=AMBER)]
-    room = max(1, height - 22)
+    room = max(1, height - 22 - sum(4 if s.info else 2 for s in d.scoped))
     for n, a in enumerate(d.active[:room], 1):
         name = Text(("⚠ " if a.warn else "") + a.title, style=look.warn if a.warn else AMBER)
         name.truncate(max(10, width - 66), overflow="ellipsis", pad=True)
@@ -1027,6 +1289,7 @@ class UI:
         self.background = None  # the terminal's own background, (r, g, b), when it said
         self.live = False  # --once draws no picked row
         self.detail = None  # (project, session) open on its own page, from a project list
+        self.usage_why = None  # why the last ask for the plan's usage failed, with --usage-api
         self.sort = load_state().get("sort") if load_state().get("sort") in SORTS else "cost"  # the project lists' order
 
     @property
@@ -1234,10 +1497,8 @@ def notify(title, body, urgent=False):
 
 
 class Alerts:
-    """Each alert once per limit window: past 80%, past 90%, and on course to run out before it resets.
-    What was sent is kept in state.json, so a restart does not send it again."""
-
-    WINDOWS = [("five_hour", FIVE_HOURS, "5-hour limit"), ("seven_day", WEEK, "Weekly limit")]
+    """Each alert once per limit window, and again after a refill: past 80%, past 90%, and on course to run out
+    before it resets. What was sent is kept in state.json, so a restart does not send it again."""
 
     def __init__(self, enabled=True, send=notify):
         self.enabled = enabled
@@ -1249,12 +1510,12 @@ class Alerts:
             return
         recs = list(reader.recs.values())
         fired = []
-        for kind, span, label in self.WINDOWS:
-            info = limit_info(recs, now, kind, span)
+        for kind, span, model, label in limit_windows():
+            info = limit_info(recs, now, kind, span, model)
             if not isinstance(info, dict):
                 continue
             reset = info["reset"]
-            base = f"{kind}@{int(reset.timestamp())}"
+            base = f"{kind}@{window_ts(reset)}" + (f"~{int(info['refilled'].timestamp())}" if info["refilled"] else "")
             at = f"{WEEKDAY[reset.weekday()]} {reset:%H:%M}" if span == WEEK else f"{reset:%H:%M}"
             reached = [th for th in (80, 90) if info["pct"] >= th and f"{base}:{th}" not in self.sent]
             if reached:  # past both at once: one notice, the higher one
@@ -1275,7 +1536,8 @@ class Alerts:
             self.sent.update(keys)
             self.send(title, body, urgent)
         if fired:  # keep a limit window's alerts only until it resets
-            self.sent = {k for k in self.sent if k.startswith("ctx@") or int(k.split("@")[1].split(":")[0]) > now.timestamp()}
+            self.sent = {k for k in self.sent if k.startswith("ctx@")
+                         or int(k.split("@")[1].split(":")[0].split("~")[0]) > now.timestamp()}
             save_state(alerts=sorted(self.sent))
 
 
@@ -1400,17 +1662,17 @@ def session_page(reader, ui, look, now, width, height):
 # ---------------------------------------------------------------- where the money goes
 
 
-def limits_by_project(recs, now, look, up, hero):
-    """How many points of each limit window each project used: its $ in the window over the window's allowance."""
-    windows = [("five_hour", FIVE_HOURS, "5-hour limit"), ("seven_day", WEEK, "Weekly limit")]
+def limits_by_project(recs, now, look, up, hero, width):
+    """How many points of each limit window each project used: its $ in the window (since the window's last refill;
+    for a per-model limit, that model's $) over the window's allowance."""
+    windows = limit_windows()
     shares, totals = [], []
-    for kind, span, _ in windows:
-        info = limit_info(recs, now, kind, span)
+    for kind, span, model, _ in windows:
+        info = limit_info(recs, now, kind, span, model)
         share = defaultdict(float)
         if isinstance(info, dict) and info["allowance"] and info["allowance"].usd > 0:
-            start = info["reset"] - span
-            for r in recs:
-                if r.ts >= start:
+            for r in model_recs(recs, model) if model else recs:
+                if r.ts >= info["since"]:
                     share[r.project] += (r.usd or 0) / info["allowance"].usd * 100
             totals.append(f"{sum(share.values()):.0f}%")
         else:
@@ -1419,18 +1681,23 @@ def limits_by_project(recs, now, look, up, hero):
     t = Table(box=box.SIMPLE_HEAD, show_edge=False, show_footer=True, expand=True, pad_edge=True, footer_style="bold",
               border_style=look.muted, header_style=look.muted if hero else f"bold {look.accent}")
     t.add_column(up("Project"), no_wrap=True, ratio=1, overflow="ellipsis", footer=up("Used in all"))
-    for (_, _, label), total in zip(windows, totals):
-        t.add_column(up(label), no_wrap=True, justify="right", footer=total)
-        t.add_column("", no_wrap=True, width=10)
-    projects = sorted(set(shares[0]) | set(shares[1]), key=lambda p: (shares[1][p], shares[0][p]), reverse=True)
+    # each limit takes its name and a bar of 10, and every column 2 of padding; where that leaves the project's
+    # name under 24, the names lose " limit" and the bars shrink to 6
+    wide = width >= 24 + 22 * len(windows) + 2 * (2 * len(windows) + 1)
+    bar_w = 10 if wide else 6
+    for (*_, label), total in zip(windows, totals):
+        t.add_column(up(label if wide else label.removesuffix(" limit")), no_wrap=True, justify="right", footer=total)
+        t.add_column("", no_wrap=True, width=bar_w)
+    projects = sorted(set().union(*shares), key=lambda p: [sh[p] for sh in shares[1::-1] + shares[2:]], reverse=True)
     show = projects[:5]
     rest = projects[5:]
     pts = lambda v: "—" if v <= 0 else "<1%" if v < 1 else f"{v:.0f}%"
     for p in show + (["(other projects)"] if rest else []):
         vals = [sum(sh[q] for q in rest) if p == "(other projects)" else sh[p] for sh in shares]
-        t.add_row(up(p), *[c for v in vals for c in (pts(v), bar(v / 100, 10, look.accent))])
+        t.add_row(up(p), *[c for v in vals for c in (pts(v), bar(v / 100, bar_w, look.accent))])
     if not projects:
-        t.add_row(Text(up("no limit reading yet, or nothing used in these windows"), style=look.muted), "", "", "", "")
+        t.add_row(Text(up("no limit reading yet, or nothing used in these windows"), style=look.muted),
+                  *[""] * (2 * len(windows)))
     return t
 
 
@@ -1477,7 +1744,8 @@ def spend_page(reader, ui, look, now, width, height):
         usd = sum((r.parts or {}).get("cache write", 0) for r in mine)
         rb += [Text(f"{len(mine)}× {money(usd)}", style=look.muted), bar(usd / totals[i] if totals[i] else 0, 6, look.muted)]
     t2 = table("Paid for", rows + [rb])
-    sections = [("Your limits, by project", limits_by_project(recs, now, look, up, ui.theme == "hero")), ("By model", t1),
+    sections = [("Your limits, by project", limits_by_project(recs, now, look, up, ui.theme == "hero",
+                                                              width - (4 if dash else 0))), ("By model", t1),
                 ("By what was paid for", t2)]
     if dash:
         return [Panel(t, title=Text(f" {name} ", style=f"bold {look.accent}"), title_align="left", box=box.ROUNDED,
@@ -1607,6 +1875,8 @@ def render(reader, ui, now, width, height):
     unpriced = sorted({r.model for r in reader.recs.values() if r.usd is None})
     if unpriced:
         hint.append(f"   * no price: {', '.join(unpriced)}", style=look.muted)
+    if ui.usage_why:
+        hint.append(f"   ! {ui.usage_why.upper() if look.caps else ui.usage_why}", style=look.warn)
     screen = Layout()
     screen.split_column(Layout(tabs(ui, look, now), size=1), Layout(Group(*body)), Layout(hint, size=1))
     if look.frame:
@@ -1691,13 +1961,30 @@ def main():
     ap.add_argument("--every", type=float, default=2.0, help="seconds between reads (default 2)")
     ap.add_argument("--no-alerts", action="store_true", help="send no desktop notifications about the limits")
     ap.add_argument("--root", type=Path, default=ROOT, help="transcripts folder (default ~/.claude/projects)")
+    api = ap.add_mutually_exclusive_group()
+    api.add_argument("--usage-api", dest="usage_api", action="store_true", default=None,
+                     help="also ask Anthropic for the plan's usage every 5 min, as /usage does, with Claude Code's "
+                          "login token: the only way to see per-model limits such as Fable's (remembered)")
+    api.add_argument("--no-usage-api", dest="usage_api", action="store_false", help="stop asking (remembered)")
     args = ap.parse_args()
 
+    if args.usage_api is not None:
+        save_state(usage_api=args.usage_api)
+        if not args.usage_api:
+            USAGE.unlink(missing_ok=True)  # its readings would only grow stale
+    ask = load_state().get("usage_api") is True
     reader = Reader(args.root)
     reader.poll()
     ui = UI(PAGE_ARGS[args.page], args.theme or load_theme())
     console = Console()
     if args.once:
+        try:
+            stale = time.time() - USAGE.stat().st_mtime > USAGE_EVERY
+        except OSError:
+            stale = True
+        if ask and stale:
+            ui.usage_why = ask_usage()
+        note_refills(reader.recs.values(), dt.datetime.now().astimezone())
         console.print(render(reader, ui, dt.datetime.now().astimezone(), *console.size))
         return
 
@@ -1717,6 +2004,10 @@ def main():
     signal.set_wakeup_fd(wake)
     signal.signal(signal.SIGWINCH, lambda signum, frame: None)
     try:
+        asker = UsageAsker() if ask else None
+        if asker:
+            asker.start()
+        note_refills(reader.recs.values(), dt.datetime.now().astimezone())
         alerts = Alerts(enabled=not args.no_alerts)
         alerts.check(reader, dt.datetime.now().astimezone())
         with raw_keys() as fd:
@@ -1734,7 +2025,9 @@ def main():
                             ui.key(k)
                     if time.monotonic() >= next_read:
                         reader.poll()
+                        note_refills(reader.recs.values(), dt.datetime.now().astimezone())
                         alerts.check(reader, dt.datetime.now().astimezone())
+                        ui.usage_why = asker.why if asker else None
                         next_read = time.monotonic() + args.every
                     live.update(screen(), refresh=True)
     except KeyboardInterrupt:
